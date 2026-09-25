@@ -1,6 +1,6 @@
 # hw-memory
 
-Permanent memory for opencode agents. Single-file plugin, zero dependencies, per-project SQLite database.
+Permanent memory for opencode agents. Single-file bundle with no runtime dependencies (zod is inlined), per-project SQLite database.
 
 `docs/` markdown is the source of truth (human-first). hw-memory seeds a ranked, decaying index from it on first run, appends crucial new facts back into it automatically, and collects episodic facts from sessions.
 
@@ -58,12 +58,26 @@ never duplicates it. Then restart opencode. The DB is created at
 
 ```sh
 npm install
-npm test        # node --test, 47 tests
-npm run build   # bundles src/hw-memory.ts -> plugin/hw-memory.ts (single file, zod inlined)
+npm test              # node --test, 48 tests
+npm run test:install  # installer tests: project/global, AGENTS.md/CLAUDE.md, SHA256
+npm run build         # bundles src/hw-memory.ts -> plugin/hw-memory.ts (single file, zod inlined)
 npm run typecheck
 ```
 
 Runtime: the plugin runs inside opencode's Bun (`bun:sqlite`); tests run on Node 26+ (`node:sqlite`) via a small runtime adapter. FTS5 keyword search only; schema leaves room for future embeddings.
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs typecheck, tests, installer tests and a
+bundle-drift check on every push and PR. To publish a release, bump `version` in
+`package.json`, then tag and push:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The Release workflow verifies the tag matches `package.json`, runs the same
+checks, builds, and publishes `hw-memory.ts`, `hw-memory.md` and `SHA256SUMS`.
 
 ## Docs layout
 
