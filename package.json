@@ -1,0 +1,19 @@
+{
+  "name": "hw-memory",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test 'test/*.test.ts'",
+    "test:install": "bash scripts/test-install.sh",
+    "build": "esbuild src/hw-memory.ts --bundle --format=esm --platform=neutral --external:bun:sqlite --external:node:* --outfile=plugin/hw-memory.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.5.9",
+    "@types/node": "^26.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0",
+    "zod": "^4.1.8"
+  }
+}
