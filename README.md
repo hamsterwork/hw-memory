@@ -66,29 +66,6 @@ npm run typecheck
 
 Runtime: the plugin runs inside opencode's Bun (`bun:sqlite`); tests run on Node 26+ (`node:sqlite`) via a small runtime adapter. FTS5 keyword search only; schema leaves room for future embeddings.
 
-## Releasing
-
-CI (`.github/workflows/ci.yml`) runs typecheck, tests, installer tests and a
-bundle-drift check on every push and PR. To publish a release, bump `version` in
-`package.json`, then tag and push:
-
-```sh
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-The Release workflow verifies the tag matches `package.json`, runs the same
-checks, builds, and publishes `hw-memory.ts`, `hw-memory.md` and `SHA256SUMS`.
-
-## Docs layout
-
-| File | Tool reads (seed) | Tool writes |
-|---|---|---|
-| `docs/decisions.md` | critical | append, renumbered ADR items |
-| `docs/gotchas.md` | high | append under `## YYYY-MM` |
-| `docs/Changelog.md` | low | append dated lines |
-| `docs/context.md`, `docs/architecture/`, `docs/roles/` | high/medium | never (human-only) |
-| `AGENTS.md`, `README.md` | medium | never |
-
 ## Safety
 
 The tool never deletes memories of rank critical/high, never deletes files, and never runs `hw_memory_seed`/`hw_memory_migrate` without an explicit user command. Manual edits to docs are not tracked; run `hw_memory_seed` to compare and re-sync.
