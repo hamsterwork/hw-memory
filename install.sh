@@ -250,7 +250,7 @@ log ""
 log "hw-memory installed — $scope"
 log "  plugin: $plugin_dir/hw-memory.ts"
 if [ "$rules_written" = 1 ]; then
-  log "  rules:  $rules_file${rules_file##*/}"
+  log "  rules:  $rules_file"
 fi
 if [ "$GLOBAL" = 0 ] && [ -d "$target/.memory" ]; then
   log ""

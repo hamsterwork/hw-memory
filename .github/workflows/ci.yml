@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:install
+      - run: npm run build
+
+      - name: Verify bundled plugin is up to date
+        run: |
+          if ! git diff --exit-code -- plugin/hw-memory.ts; then
+            echo "::error::plugin/hw-memory.ts is stale — run 'npm run build' and commit the result" >&2
+            exit 1
+          fi
