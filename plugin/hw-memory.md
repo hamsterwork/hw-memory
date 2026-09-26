@@ -26,4 +26,5 @@ You have permanent project memory via hw-memory tools. The project's `docs/` mar
 - If a recalled fact conflicts with its source doc file (`src:` pointer), the doc file wins.
 - Do not re-store facts that live in docs/ — seeding already indexed them (or will, once the user runs hw_memory_seed).
 - Do not store run-specific data (build output, test numbers) — only durable knowledge.
+- In all cases do not store any credentials or secrets - only a way to access them (for example - from config files).
 - Ranks: `critical` never fades, `high` fades slowly (both never auto-deleted), `medium` default, `low` for ephemera that should fade fast.
