@@ -8,7 +8,9 @@ import {
   forgetFact,
   getFact,
   initSchema,
+  listDebt,
   maintain,
+  resolveDebt,
   searchFacts,
   statsFacts,
   updateOrigin,
@@ -16,7 +18,22 @@ import {
   type Kind,
   type Rank,
 } from "./core.ts"
-import { docsFooterLines, reSeedFromDocs, writeCrucialToDocs } from "./docs.ts"
+import {
+  docsFooterLines,
+  removeEntityLine,
+  reSeedFromDocs,
+  reworkFileIntoDb,
+  syncEntityToFile,
+} from "./docs.ts"
+import {
+  getTarget,
+  isManagedKind,
+  isSafeRelPath,
+  listTargets,
+  setTarget,
+  type ManagedKind,
+} from "./config.ts"
+import { isFile } from "./fs.ts"
 import {
   commandSignature,
   extractFromAssistantText,
@@ -44,18 +61,20 @@ function formatFacts(rows: { id: number; rank: string; kind: string; content: st
 function makeTools(root: string, db: DB): Record<string, ToolDefinition> {
   const memoryAdd = defineTool({
     description:
-      "Store a durable project fact into hw-memory. One fact per call. Crucial facts (kind decision/gotcha or rank critical/high) are also appended to docs/ markdown automatically. Use for: pinned decisions, resolved pitfalls, project constraints.",
+      "Store a durable project fact into hw-memory. One fact per call. Managed kinds (decision/gotcha/debt) are also written to their managed markdown file when that entity is enabled. Use for: pinned decisions, resolved pitfalls, technical debt, project constraints.",
     args: {
       content: z.string().describe("One dense fact, single sentence or two. Language-agnostic."),
       keywords: z.string().optional().describe("3-6 comma-separated terms that boost keyword search."),
       kind: z
-        .enum(["decision", "gotcha", "error", "dependency", "fact", "changelog"])
+        .enum(["decision", "gotcha", "debt", "error", "dependency", "fact", "changelog"])
         .optional()
-        .describe("Fact category. decision and gotcha are written to docs/."),
+        .describe("Fact category. decision/gotcha/debt are also written to their managed file when enabled."),
       rank: z
         .enum(["critical", "high", "medium", "low"])
         .optional()
-        .describe("critical: never fades. high: slow decay, never pruned. medium: default. low: fades fast."),
+        .describe(
+          "critical: never fades. high: slow decay, never pruned. medium: default. low: fades fast. Debt is clamped to medium..critical.",
+        ),
     },
     async execute(args) {
       const res = addFact(db, {
@@ -66,21 +85,13 @@ function makeTools(root: string, db: DB): Record<string, ToolDefinition> {
         source: "agent",
       })
       let note = ""
-      if (res.status === "inserted" && res.crucial) {
-        const fact = getFact(db, res.id)
-        const written = writeCrucialToDocs(root, {
-          id: res.id,
-          content: fact!.content,
-          keywords: fact!.keywords ? fact!.keywords.split(",") : [],
-          kind: res.kind,
-          rank: res.rank,
-        })
-        if (written.written) {
-          updateOrigin(db, res.id, written.origin)
-          note = ` Also appended to ${written.file}.`
-        }
+      if (res.status === "inserted" && isManagedKind(res.kind)) {
+        const sync = syncEntityToFile(db, root, res.kind)
+        if (sync.written > 0) note = ` Also written to ${sync.file}.`
       }
-      return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}`
+      const debtNote =
+        res.kind === "debt" ? " ⚠ Technical debt recorded — tell the user about it before finishing the task." : ""
+      return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}${debtNote}`
     },
   })
 
@@ -108,9 +119,11 @@ function makeTools(root: string, db: DB): Record<string, ToolDefinition> {
         `by rank: ${JSON.stringify(stats.byRank)}`,
         `by kind: ${JSON.stringify(stats.byKind)}`,
         `by source: ${JSON.stringify(stats.bySource)}`,
+        `open debt: ${stats.debt}`,
         `avg weight: ${stats.avgWeight.toFixed(3)}`,
         `db: ${join(root, ".opencode", "hw-memory.db")}`,
-        `docs: ${docsFooterLines(root).join("; ") || "none"}`,
+        `files: ${listTargets(db).map((t) => `${t.kind}=${t.enabled ? t.path : "off"}`).join("; ")}`,
+        `docs: ${docsFooterLines(root, db).join("; ") || "none"}`,
       ]
       return lines.join("\n")
     },
@@ -146,19 +159,105 @@ function makeTools(root: string, db: DB): Record<string, ToolDefinition> {
 
   const memoryMigrate = defineTool({
     description:
-      "Migrate legacy .memory/ folder into docs/ layout, then seed the DB. Direct user command only. Default dry-run; apply=true executes. Never deletes .memory/ — user removes it manually.",
+      "Migrate a legacy .memory/ folder and/or upgrade legacy docs/decisions.md + docs/gotchas.md to the managed docs/hw-memory/ layout, then seed the DB. Direct user command only. Default dry-run; apply=true executes. Never deletes .memory/ — user removes it manually.",
     args: { apply: z.boolean().optional().describe("Apply migration. Default false (dry-run plan).") },
     async execute(args) {
       const report = migrateMemoryDir(db, root, args.apply ?? false)
-      if (!report.memoryDirFound) return "No .memory/ folder found."
+      if (!report.memoryDirFound && report.moved.length === 0 && report.copied.length === 0) {
+        return "Nothing to migrate: no .memory/ folder and no legacy docs/decisions.md or docs/gotchas.md."
+      }
       const lines = [`${report.apply ? "APPLIED" : "DRY-RUN"} migration:`]
+      for (const m of report.moved) lines.push(`- move ${m.from} -> ${m.to}`)
       for (const c of report.copied) lines.push(`- ${c.from} -> ${c.to}${c.merged ? " (merge into existing)" : ""}`)
+      if (report.targetsEnabled.length > 0) {
+        lines.push(`- enable managed files: ${report.targetsEnabled.join(", ")}`)
+      }
       if (report.agentsUpdated) lines.push(`- append "## Documentation" section to AGENTS.md`)
       for (const r of report.reviewManually) lines.push(`- review manually: ${r}`)
       if (report.apply && report.seed) {
         lines.push("", `seed: files=${report.seed.files} inserted=${report.seed.inserted} updated=${report.seed.updated}`)
       }
       return lines.join("\n")
+    },
+  })
+
+  const memoryDebt = defineTool({
+    description:
+      "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id removes it (and its line from the managed debt file when enabled). Always tell the user about new debt before finishing a task.",
+    args: {
+      action: z.enum(["list", "resolve"]).optional().describe("list (default) or resolve."),
+      id: z.number().optional().describe("Debt id to resolve."),
+    },
+    async execute(args) {
+      if (args.action === "resolve") {
+        if (args.id == null) return "Provide the debt id to resolve."
+        const fact = resolveDebt(db, args.id)
+        if (!fact) return `#${args.id} is not an open debt item.`
+        const target = getTarget(db, "debt")
+        if (target.enabled) removeEntityLine(root, target.path, fact.content)
+        return `Resolved and removed debt #${args.id}.`
+      }
+      const rows = listDebt(db)
+      if (rows.length === 0) return "No open technical debt."
+      return rows
+        .map((f) => `#${f.id} [${f.rank}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`)
+        .join("\n")
+    },
+  })
+
+  const memoryConfig = defineTool({
+    description:
+      "Get or set hw-memory managed-file targets. decision, gotcha and debt can each be enabled/disabled and pointed at a repo-relative .md path (default docs/hw-memory/<entity>.md). Disabled means facts live only in the DB.",
+    args: {
+      entity: z.enum(["decision", "gotcha", "debt"]).optional().describe("Entity to configure; omit to list all."),
+      enabled: z.boolean().optional().describe("Enable or disable write-back for the entity."),
+      path: z.string().optional().describe("Repo-relative .md path for the entity."),
+    },
+    async execute(args) {
+      if (!args.entity) {
+        return listTargets(db)
+          .map((t) => `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`)
+          .join("\n")
+      }
+      if (args.path !== undefined && !isSafeRelPath(args.path)) {
+        return `Invalid path: ${args.path}. Use a repo-relative path without "..".`
+      }
+      const t = setTarget(db, args.entity, { enabled: args.enabled, path: args.path })
+      return `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`
+    },
+  })
+
+  const memoryFile = defineTool({
+    description:
+      "Attach or sync a managed markdown file for decision/gotcha/debt. With file, sets it as the entity target and enables write-back. By default appends the entity's facts that are missing from the file, leaving existing content untouched. rework=true also reads the existing file and adds its content to the entity in the DB (for pre-existing memoirs outside docs/).",
+    args: {
+      kind: z.enum(["decision", "gotcha", "debt"]).describe("Entity to write."),
+      file: z
+        .string()
+        .optional()
+        .describe("Repo-relative .md path; persists as the entity target and enables write-back."),
+      rework: z.boolean().optional().describe("Read the existing file into the entity before appending."),
+    },
+    async execute(args) {
+      const kind = args.kind as ManagedKind
+      if (args.file !== undefined && !isSafeRelPath(args.file)) {
+        return `Invalid file: ${args.file}. Use a repo-relative path without "..".`
+      }
+      if (args.file) setTarget(db, kind, { path: args.file, enabled: true })
+      const target = getTarget(db, kind)
+      const rel = args.file ?? target.path
+      const abs = join(root, rel)
+      let reworkNote = ""
+      if (args.rework) {
+        if (isFile(abs)) {
+          const r = reworkFileIntoDb(db, root, kind, rel)
+          reworkNote = ` Reworked ${rel}: facts=${r.facts} inserted=${r.inserted} updated=${r.updated}.`
+        } else {
+          reworkNote = ` Rework skipped: ${rel} does not exist.`
+        }
+      }
+      const sync = syncEntityToFile(db, root, kind)
+      return `${rel}: appended=${sync.written}.${reworkNote}`
     },
   })
 
@@ -169,6 +268,9 @@ function makeTools(root: string, db: DB): Record<string, ToolDefinition> {
     hw_memory_forget: memoryForget,
     hw_memory_seed: memorySeed,
     hw_memory_migrate: memoryMigrate,
+    hw_memory_debt: memoryDebt,
+    hw_memory_config: memoryConfig,
+    hw_memory_file: memoryFile,
   }
 }
 
@@ -195,22 +297,15 @@ export const HwMemoryPlugin: Plugin = async ({ directory, worktree, client }) =>
     if (!fact || fact.kind !== "error") return
     db.prepare("UPDATE memories SET kind = 'gotcha', rank = 'high', weight = 1.0, last_verified_at = ? WHERE id = ?")
       .run(new Date().toISOString(), id)
-    const updated = getFact(db, id)
-    const written = writeCrucialToDocs(root, {
-      id,
-      content: updated!.content,
-      keywords: updated!.keywords ? updated!.keywords.split(",") : [],
-      kind: "gotcha",
-      rank: "high",
-    })
-    if (written.written) updateOrigin(db, id, written.origin)
+    const sync = syncEntityToFile(db, root, "gotcha")
+    if (sync.written > 0 && sync.origin) updateOrigin(db, id, sync.origin)
   }
 
   return {
     "experimental.chat.system.transform": async (_input, output) => {
       try {
         maintain(db)
-        output.system.push(wakeUpPack(db, docsFooterLines(root)))
+        output.system.push(wakeUpPack(db, docsFooterLines(root, db)))
       } catch (e) {
         console.error("hw-memory wake-up failed:", e)
       }

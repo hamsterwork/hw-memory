@@ -1,8 +1,9 @@
 import type { DB } from "./db.ts"
+import { ensureFileTargets } from "./config.ts"
 import { contentHash, daysSince, ftsQuery, nowISO, tokenize, tokenSet } from "./util.ts"
 
 export type Rank = "critical" | "high" | "medium" | "low"
-export type Kind = "decision" | "gotcha" | "error" | "dependency" | "fact" | "changelog"
+export type Kind = "decision" | "gotcha" | "debt" | "error" | "dependency" | "fact" | "changelog"
 export type Source = "auto" | "agent" | "seed"
 
 export const BASE_RATE = 0.008
@@ -54,7 +55,12 @@ export interface AddResult {
 }
 
 export function isCrucial(kind: Kind, rank: Rank): boolean {
-  return kind === "decision" || kind === "gotcha" || rank === "critical" || rank === "high"
+  return kind === "decision" || kind === "gotcha" || kind === "debt" || rank === "critical" || rank === "high"
+}
+
+export function clampDebtRank(rank?: Rank): Rank {
+  if (rank === "critical" || rank === "high") return rank
+  return "medium"
 }
 
 export function promoteRank(rank: Rank, accesses: number): Rank {
@@ -93,7 +99,13 @@ export function initSchema(db: DB): void {
       INSERT INTO memories_fts(memories_fts, rowid, content, keywords) VALUES ('delete', old.id, old.content, old.keywords);
       INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.id, new.content, new.keywords);
     END;
+    CREATE TABLE IF NOT EXISTS file_targets (
+      kind TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 0,
+      path TEXT NOT NULL
+    );
   `)
+  ensureFileTargets(db)
 }
 
 export function effectiveAgeDays(row: Pick<FactRow, "created_at" | "last_verified_at">): number {
@@ -161,12 +173,13 @@ export function findSimilar(db: DB, content: string, kind: Kind): FactRow | null
 export function addFact(db: DB, input: AddInput): AddResult {
   const content = input.content.trim().replace(/\s+/g, " ")
   const kind = input.kind ?? "fact"
+  const requestedRank = kind === "debt" ? clampDebtRank(input.rank) : input.rank
   const dup = findSimilar(db, content, kind)
   const now = nowISO()
   if (dup) {
     const accesses = dup.accesses + 1
     let rank = dup.rank
-    if (input.rank && RANK_ORDER[input.rank] > RANK_ORDER[rank]) rank = input.rank
+    if (requestedRank && RANK_ORDER[requestedRank] > RANK_ORDER[rank]) rank = requestedRank
     const promoted = rank !== dup.rank
     rank = promoteRank(rank, accesses)
     const keywords = mergeKeywords(dup.keywords, input.keywords ?? [])
@@ -177,7 +190,7 @@ export function addFact(db: DB, input: AddInput): AddResult {
     ).run(accesses, rank, keywords, weight, input.verified ?? null, now, dup.id)
     return { status: "updated", id: dup.id, kind: dup.kind, rank, crucial: isCrucial(dup.kind, rank), promoted }
   }
-  const rank = input.rank ?? "medium"
+  const rank = requestedRank ?? "medium"
   const weight = RANK_TABLE[rank].init
   const info = db
     .prepare(
@@ -286,7 +299,7 @@ export function maintain(db: DB, force = false): MaintainReport {
     let rank = promoteRank(fact.rank, fact.accesses)
     const weight = computeWeight(rank, fact.accesses, effectiveAgeDays(fact))
     if (rank !== fact.rank) report.promoted++
-    if (RANK_TABLE[rank].prunable && weight < PRUNE_WEIGHT) {
+    if (fact.kind !== "debt" && RANK_TABLE[rank].prunable && weight < PRUNE_WEIGHT) {
       pruneIds.push(fact.id)
       continue
     }
@@ -306,7 +319,7 @@ export function maintain(db: DB, force = false): MaintainReport {
   if (total > CAP_ROWS) {
     const extra = (db
       .prepare(
-        `SELECT id FROM memories WHERE rank IN ('medium','low') ORDER BY weight ASC, accesses ASC LIMIT ?`,
+        `SELECT id FROM memories WHERE rank IN ('medium','low') AND kind != 'debt' ORDER BY weight ASC, accesses ASC LIMIT ?`,
       )
       .all(total - CAP_ROWS) as any[]).map((r) => r.id as number)
     for (const id of extra) db.prepare("DELETE FROM memories WHERE id = ?").run(id)
@@ -327,6 +340,23 @@ export function forgetKind(db: DB, kind: Kind): number {
   return res.changes ?? 0
 }
 
+export function listDebt(db: DB): FactRow[] {
+  return (db
+    .prepare("SELECT * FROM memories WHERE kind = 'debt' ORDER BY weight DESC, created_at DESC")
+    .all() as any[]).map(rowToFact)
+}
+
+export function countDebt(db: DB): number {
+  return (db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'debt'").get() as any).c as number
+}
+
+export function resolveDebt(db: DB, id: number): FactRow | null {
+  const fact = getFact(db, id)
+  if (!fact || fact.kind !== "debt") return null
+  forgetFact(db, id)
+  return fact
+}
+
 export interface StatsReport {
   total: number
   byRank: Record<string, number>
@@ -334,6 +364,7 @@ export interface StatsReport {
   bySource: Record<string, number>
   avgWeight: number
   oldest: string | null
+  debt: number
 }
 
 export function statsFacts(db: DB): StatsReport {
@@ -357,6 +388,7 @@ export function statsFacts(db: DB): StatsReport {
     bySource,
     avgWeight: rows.length ? weightSum / rows.length : 0,
     oldest,
+    debt: byKind["debt"] ?? 0,
   }
 }
 
@@ -368,7 +400,8 @@ export function wakeUpPack(db: DB, docsFooter: string[], charBudget = 2500): str
     .prepare("SELECT * FROM memories WHERE rank = 'medium' ORDER BY weight DESC LIMIT 5")
     .all() as any[]).map(rowToFact)
   const lines: string[] = ["## hw-memory — persistent project memory (top facts)"]
-  if (crucial.length === 0 && medium.length === 0) {
+  const debtTotal = countDebt(db)
+  if (crucial.length === 0 && medium.length === 0 && debtTotal === 0) {
     lines.push(
       "Memory DB is empty. If this project has docs/, suggest the user run hw_memory_seed (dry-run report first, then apply=true).",
     )
@@ -383,6 +416,15 @@ export function wakeUpPack(db: DB, docsFooter: string[], charBudget = 2500): str
   }
   for (const f of [...crucial, ...medium]) {
     if (!push(f)) break
+  }
+  const debt = (db
+    .prepare("SELECT * FROM memories WHERE kind = 'debt' ORDER BY weight DESC LIMIT 5")
+    .all() as any[]).map(rowToFact)
+  if (debtTotal > 0) {
+    lines.push("", `## Open technical debt (${debtTotal}) — tell the user about new items before finishing`)
+    for (const f of debt) {
+      if (!push(f)) break
+    }
   }
   if (docsFooter.length > 0) {
     lines.push("", "## Authoritative docs (source of truth)", ...docsFooter.map((d) => `- ${d}`))

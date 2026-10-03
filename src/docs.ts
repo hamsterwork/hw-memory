@@ -1,9 +1,17 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
-import { isDir, isFile } from "./fs.ts"
 import type { DB } from "./db.ts"
+import { isDir, isFile } from "./fs.ts"
 import type { FactRow, Kind, Rank } from "./core.ts"
 import { addFact } from "./core.ts"
+import {
+  DEFAULT_TARGET_PATH,
+  getTarget,
+  listTargets,
+  MANAGED_KINDS,
+  type FileTarget,
+  type ManagedKind,
+} from "./config.ts"
 import { contentHash, keywordsFrom, parseVerifiedDate, stripMarkdown, titleFrom, tokenize, todayISO } from "./util.ts"
 
 export interface DocFact {
@@ -16,12 +24,19 @@ export interface DocFact {
   verified: string | null
 }
 
+export function managedRank(kind: ManagedKind): Rank {
+  if (kind === "decision") return "critical"
+  if (kind === "gotcha") return "high"
+  return "medium"
+}
+
 export function rankForPath(rel: string): { kind: Kind; rank: Rank } | null {
   const p = rel.replaceAll("\\", "/").toLowerCase()
   if (p.startsWith(".memory/") || p.startsWith(".opencode/") || p.startsWith("node_modules/")) return null
   const base = p.split("/").pop() ?? p
   if (base === "decisions.md") return { kind: "decision", rank: "critical" }
   if (base === "gotchas.md") return { kind: "gotcha", rank: "high" }
+  if (base === "debt.md") return { kind: "debt", rank: "medium" }
   if (base === "context.md") return { kind: "fact", rank: "high" }
   if (p.startsWith("docs/architecture/")) return { kind: "fact", rank: "high" }
   if (p.startsWith("docs/rules/")) return { kind: "decision", rank: "critical" }
@@ -41,8 +56,12 @@ function slugify(text: string): string {
   )
 }
 
-export function parseDocFile(absPath: string, rel: string): DocFact[] {
-  const mapping = rankForPath(rel)
+export function parseDocFile(
+  absPath: string,
+  rel: string,
+  override?: { kind: Kind; rank: Rank },
+): DocFact[] {
+  const mapping = override ?? rankForPath(rel)
   if (!mapping) return []
   let text: string
   try {
@@ -104,25 +123,38 @@ export function parseDocFile(absPath: string, rel: string): DocFact[] {
 export interface DocFile {
   abs: string
   rel: string
+  override?: { kind: Kind; rank: Rank }
 }
 
-export function discoverDocFiles(root: string): DocFile[] {
+export function discoverDocFiles(root: string, targets: FileTarget[] = []): DocFile[] {
   const out: DocFile[] = []
+  const seen = new Set<string>()
   for (const rel of ["AGENTS.md", "README.md", "CHANGELOG.md"]) {
     const abs = join(root, rel)
-    if (isFile(abs)) out.push({ abs, rel })
+    if (isFile(abs)) {
+      out.push({ abs, rel })
+      seen.add(rel)
+    }
   }
   const docsDir = join(root, "docs")
   if (isDir(docsDir)) {
     for (const entry of readdirSync(docsDir, { recursive: true }) as string[]) {
       const rel = `docs/${entry.replaceAll("\\", "/")}`
       if (!rel.endsWith(".md")) continue
+      if (seen.has(rel)) continue
+      if (rankForPath(rel) === null) continue
       out.push({ abs: join(root, rel), rel })
+      seen.add(rel)
     }
   }
-  return out
-    .filter((f) => rankForPath(f.rel) !== null)
-    .sort((a, b) => a.rel.localeCompare(b.rel))
+  for (const t of targets) {
+    if (!t.enabled || seen.has(t.path)) continue
+    const abs = join(root, t.path)
+    if (!isFile(abs)) continue
+    out.push({ abs, rel: t.path, override: { kind: t.kind, rank: managedRank(t.kind) } })
+    seen.add(t.path)
+  }
+  return out.sort((a, b) => a.rel.localeCompare(b.rel))
 }
 
 export interface SeedReport {
@@ -133,10 +165,10 @@ export interface SeedReport {
 }
 
 export function seedFromDocs(db: DB, root: string): SeedReport {
-  const files = discoverDocFiles(root)
+  const files = discoverDocFiles(root, listTargets(db))
   const report: SeedReport = { files: files.length, facts: 0, inserted: 0, updated: 0 }
   for (const f of files) {
-    for (const doc of parseDocFile(f.abs, f.rel)) {
+    for (const doc of parseDocFile(f.abs, f.rel, f.override)) {
       report.facts++
       const res = addFact(db, {
         content: doc.content,
@@ -176,9 +208,9 @@ function similarity(a: Set<string>, b: Set<string>): number {
 }
 
 export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedReport {
-  const files = discoverDocFiles(root)
+  const files = discoverDocFiles(root, listTargets(db))
   const docFacts: DocFact[] = []
-  for (const f of files) docFacts.push(...parseDocFile(f.abs, f.rel))
+  for (const f of files) docFacts.push(...parseDocFile(f.abs, f.rel, f.override))
   const report: ReSeedReport = {
     apply,
     files: files.length,
@@ -265,7 +297,7 @@ export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedRepor
   }
   const crucial = db
     .prepare(
-      "SELECT id, kind, rank, content FROM memories WHERE source != 'seed' AND origin IS NULL AND (kind IN ('decision','gotcha') OR rank IN ('critical','high'))",
+      "SELECT id, kind, rank, content FROM memories WHERE source != 'seed' AND origin IS NULL AND (kind IN ('decision','gotcha','debt') OR rank IN ('critical','high'))",
     )
     .all() as any[]
   report.missingFromDocs = crucial.map((c) => ({ id: c.id, kind: c.kind, rank: c.rank, content: c.content }))
@@ -292,25 +324,7 @@ export interface WriteResult {
   file: string
 }
 
-export function writeCrucialToDocs(
-  root: string,
-  fact: { id: number; content: string; keywords: string[]; kind: Kind; rank: Rank },
-): WriteResult {
-  const title = titleFrom(fact.content, fact.keywords)
-  if (fact.kind === "decision" || fact.rank === "critical") {
-    return writeDecision(root, fact.content, title)
-  }
-  if (fact.kind === "gotcha") {
-    return writeGotcha(root, fact.content, title)
-  }
-  if (fact.kind === "changelog") {
-    return writeChangelog(root, fact.content)
-  }
-  return { written: false, origin: "", file: "" }
-}
-
-function writeDecision(root: string, content: string, title: string): WriteResult {
-  const rel = "docs/decisions.md"
+function writeDecision(root: string, rel: string, content: string, title: string): WriteResult {
   const abs = join(root, rel)
   let text = ""
   if (isFile(abs)) text = readFileSync(abs, "utf8")
@@ -334,13 +348,11 @@ function writeDecision(root: string, content: string, title: string): WriteResul
   return { written: true, origin: `${rel}#${next}`, file: rel }
 }
 
-function writeGotcha(root: string, content: string, title: string): WriteResult {
-  const rel = "docs/gotchas.md"
+function writeMonthlyFile(root: string, rel: string, header: string, bullet: string): WriteResult {
   const abs = join(root, rel)
   const month = todayISO().slice(0, 7)
-  const bullet = `- **${title}**: ${content}`
   if (!isFile(abs)) {
-    writeLines(abs, ["# Gotchas", "", `## ${month}`, "", bullet, ""])
+    writeLines(abs, [header, "", `## ${month}`, "", bullet, ""])
     return { written: true, origin: `${rel}#${month}`, file: rel }
   }
   const lines = normalizedLines(readFileSync(abs, "utf8"))
@@ -367,30 +379,101 @@ function writeGotcha(root: string, content: string, title: string): WriteResult 
   return { written: true, origin: `${rel}#${month}`, file: rel }
 }
 
-function writeChangelog(root: string, content: string): WriteResult {
-  const rel = "docs/Changelog.md"
-  const abs = join(root, rel)
-  const line = `- ${todayISO()}: ${content}`
-  if (!isFile(abs)) {
-    writeLines(abs, ["# Changelog", "", line, ""])
-    return { written: true, origin: rel, file: rel }
-  }
-  const lines = normalizedLines(readFileSync(abs, "utf8"))
-  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
-  lines.push(line, "")
-  writeLines(abs, lines)
-  return { written: true, origin: rel, file: rel }
+export function writeEntity(
+  root: string,
+  kind: ManagedKind,
+  rel: string,
+  content: string,
+  rank: Rank,
+  keywords: string[] = [],
+): WriteResult {
+  const title = titleFrom(content, keywords)
+  if (kind === "decision") return writeDecision(root, rel, content, title)
+  if (kind === "gotcha") return writeMonthlyFile(root, rel, "# Gotchas", `- **${title}**: ${content}`)
+  return writeMonthlyFile(root, rel, "# Technical Debt", `- **[${rank}] ${title}**: ${content}`)
 }
 
-export function docsFooterLines(root: string): string[] {
+export interface SyncResult {
+  file: string
+  written: number
+  origin: string
+}
+
+export function syncEntityToFile(db: DB, root: string, kind: ManagedKind): SyncResult {
+  const target = getTarget(db, kind)
+  if (!target.enabled) return { file: target.path, written: 0, origin: "" }
+  const rel = target.path
+  const abs = join(root, rel)
+  let existingNorm = ""
+  if (isFile(abs)) existingNorm = stripMarkdown(readFileSync(abs, "utf8"))
+  const rows = (db.prepare("SELECT * FROM memories WHERE kind = ? ORDER BY created_at ASC").all(kind) as any[]).map(
+    (r) => r as FactRow,
+  )
+  let written = 0
+  let origin = ""
+  for (const f of rows) {
+    if (existingNorm.includes(f.content)) continue
+    const res = writeEntity(root, kind, rel, f.content, f.rank, f.keywords ? f.keywords.split(",") : [])
+    if (res.written) {
+      written++
+      origin = res.origin
+      existingNorm = isFile(abs) ? stripMarkdown(readFileSync(abs, "utf8")) : `${existingNorm}\n${f.content}\n`
+    }
+  }
+  return { file: rel, written, origin }
+}
+
+export interface ReworkResult {
+  facts: number
+  inserted: number
+  updated: number
+}
+
+export function reworkFileIntoDb(db: DB, root: string, kind: ManagedKind, rel: string): ReworkResult {
+  const abs = join(root, rel)
+  const report: ReworkResult = { facts: 0, inserted: 0, updated: 0 }
+  if (!isFile(abs)) return report
+  const rank = managedRank(kind)
+  for (const doc of parseDocFile(abs, rel, { kind, rank })) {
+    report.facts++
+    const res = addFact(db, {
+      content: doc.content,
+      keywords: doc.keywords,
+      kind: doc.kind,
+      rank: doc.rank,
+      source: "seed",
+      origin: doc.origin,
+      verified: doc.verified ?? undefined,
+    })
+    if (res.status === "inserted") report.inserted++
+    else report.updated++
+  }
+  return report
+}
+
+export function removeEntityLine(root: string, rel: string, content: string): boolean {
+  const abs = join(root, rel)
+  if (!isFile(abs)) return false
+  const lines = normalizedLines(readFileSync(abs, "utf8"))
+  const kept = lines.filter((l) => !stripMarkdown(l.trim()).includes(content))
+  if (kept.length === lines.length) return false
+  writeLines(abs, kept)
+  return true
+}
+
+export function docsFooterLines(root: string, db?: DB): string[] {
   const items: { rel: string; note: string }[] = [
     { rel: "AGENTS.md", note: "bootstrap rules" },
-    { rel: "docs/decisions.md", note: "pinned decisions, critical" },
-    { rel: "docs/gotchas.md", note: "resolved pitfalls, high" },
     { rel: "docs/Changelog.md", note: "chronicle" },
     { rel: "docs/context.md", note: "environment reference" },
     { rel: "docs/architecture", note: "architecture reference" },
     { rel: "docs/roles", note: "audience-specific docs" },
   ]
+  const managed: { rel: string; note: string }[] = db
+    ? listTargets(db)
+        .filter((t) => t.enabled)
+        .map((t) => ({ rel: t.path, note: `${t.kind} write-back` }))
+    : MANAGED_KINDS.map((k) => ({ rel: DEFAULT_TARGET_PATH[k], note: `${k} write-back` }))
+  for (const m of managed) items.push(m)
   return items.filter((i) => existsSync(join(root, i.rel))).map((i) => `${i.rel} — ${i.note}`)
 }

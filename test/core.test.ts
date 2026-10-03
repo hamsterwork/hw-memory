@@ -7,7 +7,9 @@ import type { DB } from "../src/db.ts"
 import { openDBFile } from "../src/db.ts"
 import {
   addFact,
+  clampDebtRank,
   computeWeight,
+  countDebt,
   countFacts,
   findSimilar,
   forgetFact,
@@ -15,8 +17,10 @@ import {
   getFact,
   initSchema,
   isCrucial,
+  listDebt,
   maintain,
   promoteRank,
+  resolveDebt,
   searchFacts,
   setRank,
   statsFacts,
@@ -233,4 +237,48 @@ test("wakeUpPack suggests seeding when memory is empty", async () => {
   assert.ok(pack.includes("hw_memory_seed"))
   dbE.close()
   rmSync(dirE, { recursive: true, force: true })
+})
+
+test("debt rank clamps low to medium and keeps high/critical", () => {
+  assert.equal(clampDebtRank(undefined), "medium")
+  assert.equal(clampDebtRank("low"), "medium")
+  assert.equal(clampDebtRank("medium"), "medium")
+  assert.equal(clampDebtRank("high"), "high")
+  assert.equal(clampDebtRank("critical"), "critical")
+  const low = addFact(db, { content: "low severity debt should be clamped upward", kind: "debt", rank: "low" })
+  assert.equal(low.rank, "medium")
+  const crit = addFact(db, { content: "critical severity debt stays critical for retention", kind: "debt", rank: "critical" })
+  assert.equal(crit.rank, "critical")
+})
+
+test("debt is listed, counted and resolved by deletion", () => {
+  const res = addFact(db, { content: "mismatch between API contract and serializers", kind: "debt", rank: "high" })
+  assert.ok(countDebt(db) >= 1)
+  assert.ok(listDebt(db).some((d) => d.id === res.id))
+  const resolved = resolveDebt(db, res.id)
+  assert.ok(resolved)
+  assert.equal(getFact(db, res.id), null)
+  assert.equal(resolveDebt(db, res.id), null)
+})
+
+test("maintain never prunes or caps debt regardless of rank", async () => {
+  const dirD = mkdtempSync(join(tmpdir(), "hwm-debt-"))
+  const dbD = await openDBFile(join(dirD, "hw-memory.db"))
+  initSchema(dbD)
+  const old = "2020-01-01T00:00:00.000Z"
+  dbD.prepare(
+    `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
+     VALUES (?, ?, '', 'debt', 'medium', 0.01, 0, 'agent', NULL, NULL, ?, NULL)`,
+  ).run("ancient unresolved debt that must survive pruning", "hash-debt", old)
+  const report = maintain(dbD, true)
+  assert.equal(report.pruned, 0)
+  assert.equal(countDebt(dbD), 1)
+  dbD.close()
+  rmSync(dirD, { recursive: true, force: true })
+})
+
+test("stats reports open debt and isCrucial covers debt", () => {
+  assert.equal(isCrucial("debt", "medium"), true)
+  const stats = statsFacts(db)
+  assert.equal(typeof stats.debt, "number")
 })

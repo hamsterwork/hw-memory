@@ -6,14 +6,19 @@ import { join } from "node:path"
 import type { DB } from "../src/db.ts"
 import { openDBFile } from "../src/db.ts"
 import { initSchema, addFact, searchFacts, getFact } from "../src/core.ts"
+import { getTarget, setTarget } from "../src/config.ts"
 import {
   discoverDocFiles,
   docsFooterLines,
+  managedRank,
   parseDocFile,
   rankForPath,
+  removeEntityLine,
   reSeedFromDocs,
+  reworkFileIntoDb,
   seedFromDocs,
-  writeCrucialToDocs,
+  syncEntityToFile,
+  writeEntity,
 } from "../src/docs.ts"
 
 let dir: string
@@ -120,6 +125,8 @@ test.after(() => {
 test("rankForPath mapping", () => {
   assert.deepEqual(rankForPath("docs/decisions.md"), { kind: "decision", rank: "critical" })
   assert.deepEqual(rankForPath("docs/gotchas.md"), { kind: "gotcha", rank: "high" })
+  assert.deepEqual(rankForPath("docs/hw-memory/decisions.md"), { kind: "decision", rank: "critical" })
+  assert.deepEqual(rankForPath("docs/hw-memory/debt.md"), { kind: "debt", rank: "medium" })
   assert.deepEqual(rankForPath("docs/context.md"), { kind: "fact", rank: "high" })
   assert.deepEqual(rankForPath("docs/architecture/00-overview.md"), { kind: "fact", rank: "high" })
   assert.deepEqual(rankForPath("docs/rules/rules-module.md"), { kind: "decision", rank: "critical" })
@@ -131,6 +138,12 @@ test("rankForPath mapping", () => {
   assert.equal(rankForPath(".opencode/rule/hw-memory.md"), null)
   assert.equal(rankForPath("node_modules/foo/docs/x.md"), null)
   assert.equal(rankForPath("random/notes.md"), null)
+})
+
+test("managedRank defaults per entity", () => {
+  assert.equal(managedRank("decision"), "critical")
+  assert.equal(managedRank("gotcha"), "high")
+  assert.equal(managedRank("debt"), "medium")
 })
 
 test("parseDocFile extracts facts, skips fences, tables, short nav bullets", () => {
@@ -235,35 +248,33 @@ test("reSeed reports crucial facts missing from docs", () => {
   assert.ok(report.missingFromDocs.some((m) => m.content.includes("deploying on Fridays")))
 })
 
-test("writeCrucialToDocs appends decision before Status section with next number", () => {
-  const before = readFileSync(join(dir, "docs", "decisions.md"), "utf8")
-  const res = writeCrucialToDocs(dir, {
-    id: 0,
-    content: "Auto decision appended by the memory tool itself",
-    keywords: ["auto", "decision"],
-    kind: "decision",
-    rank: "critical",
-  })
+test("writeEntity appends decision before Status section with next number", () => {
+  const rel = "docs/hw-memory/decisions.md"
+  mkdirSync(join(dir, "docs", "hw-memory"), { recursive: true })
+  writeFileSync(join(dir, rel), DECISIONS_MD)
+  const res = writeEntity(dir, "decision", rel, "Auto decision appended by the memory tool itself", "critical", [
+    "auto",
+    "decision",
+  ])
   assert.equal(res.written, true)
-  assert.equal(res.origin, "docs/decisions.md#4")
-  const after = readFileSync(join(dir, "docs", "decisions.md"), "utf8")
+  assert.equal(res.origin, `${rel}#4`)
+  const after = readFileSync(join(dir, rel), "utf8")
   assert.ok(after.includes("4. **Auto Decision**: Auto decision appended by the memory tool itself"))
   const statusIdx = after.indexOf("## Статус")
   const itemIdx = after.indexOf("4. **Auto Decision**")
   assert.ok(statusIdx > itemIdx)
-  assert.ok(before.length < after.length)
 })
 
-test("writeCrucialToDocs appends gotcha into current month section", () => {
-  const res = writeCrucialToDocs(dir, {
-    id: 0,
-    content: "Resolved pitfall about sqlite locking under parallel workers",
-    keywords: ["sqlite", "locking"],
-    kind: "gotcha",
-    rank: "high",
-  })
+test("writeEntity appends gotcha into current month section", () => {
+  const rel = "docs/hw-memory/gotchas.md"
+  mkdirSync(join(dir, "docs", "hw-memory"), { recursive: true })
+  writeFileSync(join(dir, rel), GOTCHAS_MD)
+  const res = writeEntity(dir, "gotcha", rel, "Resolved pitfall about sqlite locking under parallel workers", "high", [
+    "sqlite",
+    "locking",
+  ])
   assert.equal(res.written, true)
-  const text = readFileSync(join(dir, "docs", "gotchas.md"), "utf8")
+  const text = readFileSync(join(dir, rel), "utf8")
   const month = new Date().toISOString().slice(0, 7)
   assert.ok(text.includes(`## ${month}`))
   assert.ok(text.includes("Resolved pitfall about sqlite locking"))
@@ -272,24 +283,71 @@ test("writeCrucialToDocs appends gotcha into current month section", () => {
   assert.ok(itemIdx > monthIdx)
 })
 
-test("writeCrucialToDocs creates missing files", () => {
+test("writeEntity writes debt with severity and creates missing files", () => {
   const fresh = mkdtempSync(join(tmpdir(), "hwm-fresh-"))
-  const res = writeCrucialToDocs(fresh, {
-    id: 0,
-    content: "First ever decision captured in a brand new project",
-    keywords: ["first"],
-    kind: "decision",
-    rank: "critical",
-  })
-  assert.equal(res.origin, "docs/decisions.md#1")
-  const text = readFileSync(join(fresh, "docs", "decisions.md"), "utf8")
-  assert.ok(text.includes("1. **First**: First ever decision"))
+  const rel = "docs/hw-memory/debt.md"
+  const res = writeEntity(fresh, "debt", rel, "First ever debt captured in a brand new project", "high", ["first"])
+  assert.equal(res.origin, `${rel}#${new Date().toISOString().slice(0, 7)}`)
+  const text = readFileSync(join(fresh, rel), "utf8")
+  assert.ok(text.startsWith("# Technical Debt"))
+  assert.ok(text.includes("**[high] First**: First ever debt captured"))
   rmSync(fresh, { recursive: true, force: true })
 })
 
-test("docsFooterLines lists only existing entries", () => {
-  const footer = docsFooterLines(dir)
+test("syncEntityToFile appends missing facts and is idempotent", async () => {
+  const fresh = mkdtempSync(join(tmpdir(), "hwm-sync-"))
+  const freshDb = await openDBFile(join(fresh, ".opencode", "hw-memory.db"))
+  initSchema(freshDb)
+  setTarget(freshDb, "decision", { enabled: true, path: "docs/hw-memory/decisions.md" })
+  addFact(freshDb, {
+    content: "Decisions are synced into the managed file automatically",
+    kind: "decision",
+    rank: "critical",
+    source: "agent",
+  })
+  const first = syncEntityToFile(freshDb, fresh, "decision")
+  assert.equal(first.written, 1)
+  const second = syncEntityToFile(freshDb, fresh, "decision")
+  assert.equal(second.written, 0)
+  const text = readFileSync(join(fresh, "docs", "hw-memory", "decisions.md"), "utf8")
+  assert.equal(text.match(/managed file automatically/g)?.length, 1)
+  freshDb.close()
+  rmSync(fresh, { recursive: true, force: true })
+})
+
+test("reworkFileIntoDb ingests an existing file and removeEntityLine prunes it", async () => {
+  const fresh = mkdtempSync(join(tmpdir(), "hwm-rework-"))
+  const freshDb = await openDBFile(join(fresh, ".opencode", "hw-memory.db"))
+  initSchema(freshDb)
+  const rel = "notes/legacy-debt.md"
+  mkdirSync(join(fresh, "notes"), { recursive: true })
+  writeFileSync(
+    join(fresh, rel),
+    "# Debt\n\n- **Legacy issue**: The old importer cannot handle multi-byte separator tokens.\n",
+  )
+  const r = reworkFileIntoDb(freshDb, fresh, "debt", rel)
+  assert.equal(r.facts, 1)
+  assert.equal(r.inserted, 1)
+  const rows = searchFacts(freshDb, "multi-byte separator tokens", { kinds: ["debt"] })
+  assert.equal(rows.length, 1)
+  assert.equal(removeEntityLine(fresh, rel, rows[0].content), true)
+  assert.ok(!readFileSync(join(fresh, rel), "utf8").includes("multi-byte separator"))
+  freshDb.close()
+  rmSync(fresh, { recursive: true, force: true })
+})
+
+test("docsFooterLines lists enabled existing managed targets", () => {
+  setTarget(db, "decision", { enabled: true, path: "docs/decisions.md" })
+  setTarget(db, "gotcha", { enabled: true, path: "docs/gotchas.md" })
+  const footer = docsFooterLines(dir, db)
   assert.ok(footer.some((f) => f.startsWith("docs/decisions.md")))
   assert.ok(footer.some((f) => f.startsWith("docs/gotchas.md")))
   assert.ok(!footer.some((f) => f.includes("docs/context.md")))
+})
+
+test("file targets are disabled by default and settable", () => {
+  assert.equal(getTarget(db, "debt").enabled, false)
+  const updated = setTarget(db, "debt", { enabled: true, path: "docs/hw-memory/debt.md" })
+  assert.deepEqual(updated, { kind: "debt", enabled: true, path: "docs/hw-memory/debt.md" })
+  setTarget(db, "debt", { enabled: false })
 })

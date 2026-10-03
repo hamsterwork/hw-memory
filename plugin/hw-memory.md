@@ -7,7 +7,19 @@ You have permanent project memory via hw-memory tools. The project's `docs/` mar
 - **After resolving a non-obvious error or pitfall** — `kind: gotcha, rank: high`. One fact per call, dense, language-agnostic.
 - **When the user pins a decision or constraint** ("remember that...", "we'll always...", "never change...") — `kind: decision`, `rank: high` (or `critical` for never-forget rules).
 - **When you learn a durable project fact** not derivable quickly from code — `kind: fact`, default rank.
-- Crucial facts (decision/gotcha or rank critical/high) are automatically appended to `docs/decisions.md` / `docs/gotchas.md`. Do not duplicate them into docs manually.
+
+## Technical debt (hw_memory_add kind: debt / hw_memory_debt)
+
+- When you notice a **bug, mismatch or error unrelated to the current task**, record it immediately: `hw_memory_add` with `kind: debt` and `rank` from `medium` to `critical` (severity reflects impact — a formatting nit is `medium`, a potential 500 is `critical`).
+- Debt is never auto-deleted and never decays away; it stays until explicitly resolved with `hw_memory_debt` (`action: resolve`).
+- **Before finishing a task you MUST tell the user about every debt item you recorded in that task.** Use `hw_memory_debt` (`action: list`) to recall the open items.
+- Use `hw_memory_debt` (`action: list`) to review open debt when the user asks about known issues.
+
+## Managed files (hw_memory_config / hw_memory_file)
+
+- `decision`, `gotcha` and `debt` facts live in the DB. Each entity can *optionally* also be written to a markdown file.
+- Fresh installs have all three **disabled** (DB only). Enable and aim them with `hw_memory_config` (`entity`, `enabled`, `path`); defaults are `docs/hw-memory/decisions.md`, `gotchas.md`, `debt.md`.
+- `hw_memory_file` attaches a specific file to an entity (`kind`, `file`) and appends any missing facts. `rework: true` first reads that file's existing content into the DB — use it to adopt memoirs that live outside `docs/`.
 
 ## When to recall (hw_memory_search)
 
@@ -18,6 +30,7 @@ You have permanent project memory via hw-memory tools. The project's `docs/` mar
 
 - `hw_memory_seed` / `hw_memory_migrate`: **never run these on your own initiative.** Only when the user explicitly asks (e.g. "seed memory", "re-seed memory", "migrate .memory"). Default is a dry-run report — show it to the user and apply (`apply: true`) only after they confirm.
 - `hw_memory_seed` is also the first-time seed: on a fresh install the memory DB is empty until the user runs it. If memory is empty and the project has docs/, mention to the user that seeding is available.
+- `hw_memory_migrate` also upgrades legacy `docs/decisions.md` / `docs/gotchas.md` to the managed `docs/hw-memory/` layout and enables those entities.
 - Suggest re-seed when the user mentions they edited docs/ markdown manually.
 
 ## Rules

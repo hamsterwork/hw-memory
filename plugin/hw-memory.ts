@@ -12444,6 +12444,46 @@ async function openDBFile(path) {
   };
 }
 
+// src/config.ts
+var MANAGED_KINDS = ["decision", "gotcha", "debt"];
+var MANAGED_DIR = "docs/hw-memory";
+var DEFAULT_TARGET_PATH = {
+  decision: `${MANAGED_DIR}/decisions.md`,
+  gotcha: `${MANAGED_DIR}/gotchas.md`,
+  debt: `${MANAGED_DIR}/debt.md`
+};
+function isManagedKind(kind) {
+  return MANAGED_KINDS.includes(kind);
+}
+function isSafeRelPath(path) {
+  if (!path || path.startsWith("/") || path.startsWith("\\")) return false;
+  if (/^[A-Za-z]:[\\/]/.test(path)) return false;
+  return !path.replaceAll("\\", "/").split("/").includes("..");
+}
+function ensureFileTargets(db) {
+  for (const kind of MANAGED_KINDS) {
+    db.prepare("INSERT OR IGNORE INTO file_targets (kind, enabled, path) VALUES (?, 0, ?)").run(
+      kind,
+      DEFAULT_TARGET_PATH[kind]
+    );
+  }
+}
+function getTarget(db, kind) {
+  const r = db.prepare("SELECT kind, enabled, path FROM file_targets WHERE kind = ?").get(kind);
+  if (!r) return { kind, enabled: false, path: DEFAULT_TARGET_PATH[kind] };
+  return { kind, enabled: r.enabled !== 0, path: r.path };
+}
+function setTarget(db, kind, patch) {
+  const current = getTarget(db, kind);
+  const enabled = patch.enabled ?? current.enabled;
+  const path = patch.path ?? current.path;
+  db.prepare("UPDATE file_targets SET enabled = ?, path = ? WHERE kind = ?").run(enabled ? 1 : 0, path, kind);
+  return { kind, enabled, path };
+}
+function listTargets(db) {
+  return MANAGED_KINDS.map((kind) => getTarget(db, kind));
+}
+
 // src/util.ts
 import { createHash } from "node:crypto";
 var STOPWORDS = /* @__PURE__ */ new Set([
@@ -12631,7 +12671,11 @@ var RANK_TABLE = {
 };
 var RANK_ORDER = { critical: 3, high: 2, medium: 1, low: 0 };
 function isCrucial(kind, rank) {
-  return kind === "decision" || kind === "gotcha" || rank === "critical" || rank === "high";
+  return kind === "decision" || kind === "gotcha" || kind === "debt" || rank === "critical" || rank === "high";
+}
+function clampDebtRank(rank) {
+  if (rank === "critical" || rank === "high") return rank;
+  return "medium";
 }
 function promoteRank(rank, accesses) {
   if (rank === "low" && accesses >= 4) return "medium";
@@ -12668,7 +12712,13 @@ function initSchema(db) {
       INSERT INTO memories_fts(memories_fts, rowid, content, keywords) VALUES ('delete', old.id, old.content, old.keywords);
       INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.id, new.content, new.keywords);
     END;
+    CREATE TABLE IF NOT EXISTS file_targets (
+      kind TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 0,
+      path TEXT NOT NULL
+    );
   `);
+  ensureFileTargets(db);
 }
 function effectiveAgeDays(row) {
   const from = row.last_verified_at && row.last_verified_at > row.created_at ? row.last_verified_at : row.created_at;
@@ -12729,12 +12779,13 @@ function findSimilar(db, content, kind) {
 function addFact(db, input) {
   const content = input.content.trim().replace(/\s+/g, " ");
   const kind = input.kind ?? "fact";
+  const requestedRank = kind === "debt" ? clampDebtRank(input.rank) : input.rank;
   const dup = findSimilar(db, content, kind);
   const now = nowISO();
   if (dup) {
     const accesses = dup.accesses + 1;
     let rank2 = dup.rank;
-    if (input.rank && RANK_ORDER[input.rank] > RANK_ORDER[rank2]) rank2 = input.rank;
+    if (requestedRank && RANK_ORDER[requestedRank] > RANK_ORDER[rank2]) rank2 = requestedRank;
     const promoted = rank2 !== dup.rank;
     rank2 = promoteRank(rank2, accesses);
     const keywords = mergeKeywords(dup.keywords, input.keywords ?? []);
@@ -12745,7 +12796,7 @@ function addFact(db, input) {
     ).run(accesses, rank2, keywords, weight2, input.verified ?? null, now, dup.id);
     return { status: "updated", id: dup.id, kind: dup.kind, rank: rank2, crucial: isCrucial(dup.kind, rank2), promoted };
   }
-  const rank = input.rank ?? "medium";
+  const rank = requestedRank ?? "medium";
   const weight = RANK_TABLE[rank].init;
   const info = db.prepare(
     `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
@@ -12824,7 +12875,7 @@ function maintain(db, force = false) {
     let rank = promoteRank(fact.rank, fact.accesses);
     const weight = computeWeight(rank, fact.accesses, effectiveAgeDays(fact));
     if (rank !== fact.rank) report.promoted++;
-    if (RANK_TABLE[rank].prunable && weight < PRUNE_WEIGHT) {
+    if (fact.kind !== "debt" && RANK_TABLE[rank].prunable && weight < PRUNE_WEIGHT) {
       pruneIds.push(fact.id);
       continue;
     }
@@ -12843,7 +12894,7 @@ function maintain(db, force = false) {
   let total = countFacts(db);
   if (total > CAP_ROWS) {
     const extra = db.prepare(
-      `SELECT id FROM memories WHERE rank IN ('medium','low') ORDER BY weight ASC, accesses ASC LIMIT ?`
+      `SELECT id FROM memories WHERE rank IN ('medium','low') AND kind != 'debt' ORDER BY weight ASC, accesses ASC LIMIT ?`
     ).all(total - CAP_ROWS).map((r) => r.id);
     for (const id of extra) db.prepare("DELETE FROM memories WHERE id = ?").run(id);
     report.capped = extra.length;
@@ -12855,6 +12906,18 @@ function maintain(db, force = false) {
 function forgetFact(db, id) {
   const res = db.prepare("DELETE FROM memories WHERE id = ?").run(id);
   return (res.changes ?? 0) > 0;
+}
+function listDebt(db) {
+  return db.prepare("SELECT * FROM memories WHERE kind = 'debt' ORDER BY weight DESC, created_at DESC").all().map(rowToFact);
+}
+function countDebt(db) {
+  return db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'debt'").get().c;
+}
+function resolveDebt(db, id) {
+  const fact = getFact(db, id);
+  if (!fact || fact.kind !== "debt") return null;
+  forgetFact(db, id);
+  return fact;
 }
 function statsFacts(db) {
   const rows = db.prepare("SELECT rank, kind, source, weight, created_at FROM memories").all();
@@ -12876,14 +12939,16 @@ function statsFacts(db) {
     byKind,
     bySource,
     avgWeight: rows.length ? weightSum / rows.length : 0,
-    oldest
+    oldest,
+    debt: byKind["debt"] ?? 0
   };
 }
 function wakeUpPack(db, docsFooter, charBudget = 2500) {
   const crucial = db.prepare("SELECT * FROM memories WHERE rank IN ('critical','high') ORDER BY weight DESC LIMIT 12").all().map(rowToFact);
   const medium = db.prepare("SELECT * FROM memories WHERE rank = 'medium' ORDER BY weight DESC LIMIT 5").all().map(rowToFact);
   const lines = ["## hw-memory \u2014 persistent project memory (top facts)"];
-  if (crucial.length === 0 && medium.length === 0) {
+  const debtTotal = countDebt(db);
+  if (crucial.length === 0 && medium.length === 0 && debtTotal === 0) {
     lines.push(
       "Memory DB is empty. If this project has docs/, suggest the user run hw_memory_seed (dry-run report first, then apply=true)."
     );
@@ -12898,6 +12963,13 @@ function wakeUpPack(db, docsFooter, charBudget = 2500) {
   };
   for (const f of [...crucial, ...medium]) {
     if (!push(f)) break;
+  }
+  const debt = db.prepare("SELECT * FROM memories WHERE kind = 'debt' ORDER BY weight DESC LIMIT 5").all().map(rowToFact);
+  if (debtTotal > 0) {
+    lines.push("", `## Open technical debt (${debtTotal}) \u2014 tell the user about new items before finishing`);
+    for (const f of debt) {
+      if (!push(f)) break;
+    }
   }
   if (docsFooter.length > 0) {
     lines.push("", "## Authoritative docs (source of truth)", ...docsFooter.map((d) => `- ${d}`));
@@ -12931,12 +13003,18 @@ function isDir(path) {
 }
 
 // src/docs.ts
+function managedRank(kind) {
+  if (kind === "decision") return "critical";
+  if (kind === "gotcha") return "high";
+  return "medium";
+}
 function rankForPath(rel) {
   const p = rel.replaceAll("\\", "/").toLowerCase();
   if (p.startsWith(".memory/") || p.startsWith(".opencode/") || p.startsWith("node_modules/")) return null;
   const base = p.split("/").pop() ?? p;
   if (base === "decisions.md") return { kind: "decision", rank: "critical" };
   if (base === "gotchas.md") return { kind: "gotcha", rank: "high" };
+  if (base === "debt.md") return { kind: "debt", rank: "medium" };
   if (base === "context.md") return { kind: "fact", rank: "high" };
   if (p.startsWith("docs/architecture/")) return { kind: "fact", rank: "high" };
   if (p.startsWith("docs/rules/")) return { kind: "decision", rank: "critical" };
@@ -12949,8 +13027,8 @@ function rankForPath(rel) {
 function slugify(text) {
   return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "") || "doc";
 }
-function parseDocFile(absPath, rel) {
-  const mapping = rankForPath(rel);
+function parseDocFile(absPath, rel, override) {
+  const mapping = override ?? rankForPath(rel);
   if (!mapping) return [];
   let text;
   try {
@@ -13008,27 +13086,41 @@ function parseDocFile(absPath, rel) {
   }
   return facts;
 }
-function discoverDocFiles(root) {
+function discoverDocFiles(root, targets = []) {
   const out = [];
+  const seen = /* @__PURE__ */ new Set();
   for (const rel of ["AGENTS.md", "README.md", "CHANGELOG.md"]) {
     const abs = join(root, rel);
-    if (isFile(abs)) out.push({ abs, rel });
+    if (isFile(abs)) {
+      out.push({ abs, rel });
+      seen.add(rel);
+    }
   }
   const docsDir = join(root, "docs");
   if (isDir(docsDir)) {
     for (const entry of readdirSync(docsDir, { recursive: true })) {
       const rel = `docs/${entry.replaceAll("\\", "/")}`;
       if (!rel.endsWith(".md")) continue;
+      if (seen.has(rel)) continue;
+      if (rankForPath(rel) === null) continue;
       out.push({ abs: join(root, rel), rel });
+      seen.add(rel);
     }
   }
-  return out.filter((f) => rankForPath(f.rel) !== null).sort((a, b) => a.rel.localeCompare(b.rel));
+  for (const t of targets) {
+    if (!t.enabled || seen.has(t.path)) continue;
+    const abs = join(root, t.path);
+    if (!isFile(abs)) continue;
+    out.push({ abs, rel: t.path, override: { kind: t.kind, rank: managedRank(t.kind) } });
+    seen.add(t.path);
+  }
+  return out.sort((a, b) => a.rel.localeCompare(b.rel));
 }
 function seedFromDocs(db, root) {
-  const files = discoverDocFiles(root);
+  const files = discoverDocFiles(root, listTargets(db));
   const report = { files: files.length, facts: 0, inserted: 0, updated: 0 };
   for (const f of files) {
-    for (const doc of parseDocFile(f.abs, f.rel)) {
+    for (const doc of parseDocFile(f.abs, f.rel, f.override)) {
       report.facts++;
       const res = addFact(db, {
         content: doc.content,
@@ -13054,9 +13146,9 @@ function similarity(a, b) {
   return Math.max(jac, containment >= 0.9 ? containment : 0);
 }
 function reSeedFromDocs(db, root, apply = false) {
-  const files = discoverDocFiles(root);
+  const files = discoverDocFiles(root, listTargets(db));
   const docFacts = [];
-  for (const f of files) docFacts.push(...parseDocFile(f.abs, f.rel));
+  for (const f of files) docFacts.push(...parseDocFile(f.abs, f.rel, f.override));
   const report = {
     apply,
     files: files.length,
@@ -13142,7 +13234,7 @@ function reSeedFromDocs(db, root, apply = false) {
     }
   }
   const crucial = db.prepare(
-    "SELECT id, kind, rank, content FROM memories WHERE source != 'seed' AND origin IS NULL AND (kind IN ('decision','gotcha') OR rank IN ('critical','high'))"
+    "SELECT id, kind, rank, content FROM memories WHERE source != 'seed' AND origin IS NULL AND (kind IN ('decision','gotcha','debt') OR rank IN ('critical','high'))"
   ).all();
   report.missingFromDocs = crucial.map((c) => ({ id: c.id, kind: c.kind, rank: c.rank, content: c.content }));
   return report;
@@ -13158,21 +13250,7 @@ function writeLines(absPath, lines) {
   ensureDirFor(absPath);
   writeFileSync(absPath, lines.join("\n"));
 }
-function writeCrucialToDocs(root, fact) {
-  const title = titleFrom(fact.content, fact.keywords);
-  if (fact.kind === "decision" || fact.rank === "critical") {
-    return writeDecision(root, fact.content, title);
-  }
-  if (fact.kind === "gotcha") {
-    return writeGotcha(root, fact.content, title);
-  }
-  if (fact.kind === "changelog") {
-    return writeChangelog(root, fact.content);
-  }
-  return { written: false, origin: "", file: "" };
-}
-function writeDecision(root, content, title) {
-  const rel = "docs/decisions.md";
+function writeDecision(root, rel, content, title) {
   const abs = join(root, rel);
   let text = "";
   if (isFile(abs)) text = readFileSync(abs, "utf8");
@@ -13195,13 +13273,11 @@ function writeDecision(root, content, title) {
   writeLines(abs, lines);
   return { written: true, origin: `${rel}#${next}`, file: rel };
 }
-function writeGotcha(root, content, title) {
-  const rel = "docs/gotchas.md";
+function writeMonthlyFile(root, rel, header, bullet) {
   const abs = join(root, rel);
   const month = todayISO().slice(0, 7);
-  const bullet = `- **${title}**: ${content}`;
   if (!isFile(abs)) {
-    writeLines(abs, ["# Gotchas", "", `## ${month}`, "", bullet, ""]);
+    writeLines(abs, [header, "", `## ${month}`, "", bullet, ""]);
     return { written: true, origin: `${rel}#${month}`, file: rel };
   }
   const lines = normalizedLines(readFileSync(abs, "utf8"));
@@ -13227,30 +13303,77 @@ function writeGotcha(root, content, title) {
   writeLines(abs, lines);
   return { written: true, origin: `${rel}#${month}`, file: rel };
 }
-function writeChangelog(root, content) {
-  const rel = "docs/Changelog.md";
-  const abs = join(root, rel);
-  const line = `- ${todayISO()}: ${content}`;
-  if (!isFile(abs)) {
-    writeLines(abs, ["# Changelog", "", line, ""]);
-    return { written: true, origin: rel, file: rel };
-  }
-  const lines = normalizedLines(readFileSync(abs, "utf8"));
-  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  lines.push(line, "");
-  writeLines(abs, lines);
-  return { written: true, origin: rel, file: rel };
+function writeEntity(root, kind, rel, content, rank, keywords = []) {
+  const title = titleFrom(content, keywords);
+  if (kind === "decision") return writeDecision(root, rel, content, title);
+  if (kind === "gotcha") return writeMonthlyFile(root, rel, "# Gotchas", `- **${title}**: ${content}`);
+  return writeMonthlyFile(root, rel, "# Technical Debt", `- **[${rank}] ${title}**: ${content}`);
 }
-function docsFooterLines(root) {
+function syncEntityToFile(db, root, kind) {
+  const target = getTarget(db, kind);
+  if (!target.enabled) return { file: target.path, written: 0, origin: "" };
+  const rel = target.path;
+  const abs = join(root, rel);
+  let existingNorm = "";
+  if (isFile(abs)) existingNorm = stripMarkdown(readFileSync(abs, "utf8"));
+  const rows = db.prepare("SELECT * FROM memories WHERE kind = ? ORDER BY created_at ASC").all(kind).map(
+    (r) => r
+  );
+  let written = 0;
+  let origin = "";
+  for (const f of rows) {
+    if (existingNorm.includes(f.content)) continue;
+    const res = writeEntity(root, kind, rel, f.content, f.rank, f.keywords ? f.keywords.split(",") : []);
+    if (res.written) {
+      written++;
+      origin = res.origin;
+      existingNorm = isFile(abs) ? stripMarkdown(readFileSync(abs, "utf8")) : `${existingNorm}
+${f.content}
+`;
+    }
+  }
+  return { file: rel, written, origin };
+}
+function reworkFileIntoDb(db, root, kind, rel) {
+  const abs = join(root, rel);
+  const report = { facts: 0, inserted: 0, updated: 0 };
+  if (!isFile(abs)) return report;
+  const rank = managedRank(kind);
+  for (const doc of parseDocFile(abs, rel, { kind, rank })) {
+    report.facts++;
+    const res = addFact(db, {
+      content: doc.content,
+      keywords: doc.keywords,
+      kind: doc.kind,
+      rank: doc.rank,
+      source: "seed",
+      origin: doc.origin,
+      verified: doc.verified ?? void 0
+    });
+    if (res.status === "inserted") report.inserted++;
+    else report.updated++;
+  }
+  return report;
+}
+function removeEntityLine(root, rel, content) {
+  const abs = join(root, rel);
+  if (!isFile(abs)) return false;
+  const lines = normalizedLines(readFileSync(abs, "utf8"));
+  const kept = lines.filter((l) => !stripMarkdown(l.trim()).includes(content));
+  if (kept.length === lines.length) return false;
+  writeLines(abs, kept);
+  return true;
+}
+function docsFooterLines(root, db) {
   const items = [
     { rel: "AGENTS.md", note: "bootstrap rules" },
-    { rel: "docs/decisions.md", note: "pinned decisions, critical" },
-    { rel: "docs/gotchas.md", note: "resolved pitfalls, high" },
     { rel: "docs/Changelog.md", note: "chronicle" },
     { rel: "docs/context.md", note: "environment reference" },
     { rel: "docs/architecture", note: "architecture reference" },
     { rel: "docs/roles", note: "audience-specific docs" }
   ];
+  const managed = db ? listTargets(db).filter((t) => t.enabled).map((t) => ({ rel: t.path, note: `${t.kind} write-back` })) : MANAGED_KINDS.map((k) => ({ rel: DEFAULT_TARGET_PATH[k], note: `${k} write-back` }));
+  for (const m of managed) items.push(m);
   return items.filter((i) => existsSync(join(root, i.rel))).map((i) => `${i.rel} \u2014 ${i.note}`);
 }
 
@@ -13358,13 +13481,17 @@ var SessionTracker = class {
 };
 
 // src/migrate.ts
-import { existsSync as existsSync2, mkdirSync as mkdirSync3, readFileSync as readFileSync2, readdirSync as readdirSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync2, mkdirSync as mkdirSync3, readFileSync as readFileSync2, readdirSync as readdirSync2, rmSync, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join2 } from "node:path";
 var FILE_MAP = [
-  { from: ".memory/history/decisions.md", to: "docs/decisions.md", renumber: true },
-  { from: ".memory/ai/gotchas.md", to: "docs/gotchas.md" },
+  { from: ".memory/history/decisions.md", to: "docs/hw-memory/decisions.md", renumber: true, target: "decision" },
+  { from: ".memory/ai/gotchas.md", to: "docs/hw-memory/gotchas.md", target: "gotcha" },
   { from: ".memory/ai/context.md", to: "docs/context.md" },
   { from: ".memory/history/changelog.md", to: "docs/Changelog.md" }
+];
+var UPGRADE_MOVE = [
+  { from: "docs/decisions.md", to: "docs/hw-memory/decisions.md", target: "decision" },
+  { from: "docs/gotchas.md", to: "docs/hw-memory/gotchas.md", target: "gotcha" }
 ];
 function maxDecisionNumber(text) {
   let max = 0;
@@ -13385,48 +13512,78 @@ function appendMerged(target, source, renumber) {
 ${body}
 `;
 }
+function moveFile(fromAbs, toAbs) {
+  mkdirSync3(dirname2(toAbs), { recursive: true });
+  try {
+    rmSync(toAbs, { force: true });
+    writeFileSync2(toAbs, readFileSync2(fromAbs, "utf8"));
+    rmSync(fromAbs, { force: true });
+  } catch {
+    writeFileSync2(toAbs, readFileSync2(fromAbs, "utf8"));
+  }
+}
 function migrateMemoryDir(db, root, apply = false) {
   const report = {
     apply,
     memoryDirFound: isDir(join2(root, ".memory")),
     copied: [],
+    moved: [],
+    targetsEnabled: [],
     renumbered: false,
     reviewManually: [],
     agentsUpdated: false,
     seed: null
   };
-  if (!report.memoryDirFound) return report;
-  const actions = [];
-  for (const m of FILE_MAP) {
-    const fromAbs = join2(root, m.from);
-    if (isFile(fromAbs)) {
-      const targetAbs = join2(root, m.to);
-      const merged = isFile(targetAbs);
-      actions.push({ from: m.from, to: m.to, merged, renumber: m.renumber && merged });
-    }
-  }
-  const rolesDir = join2(root, ".memory", "roles");
-  if (isDir(rolesDir)) {
-    for (const entry of readdirSync2(rolesDir)) {
-      if (!entry.endsWith(".md")) continue;
-      actions.push({ from: `.memory/roles/${entry}`, to: `docs/roles/${entry}`, merged: isFile(join2(root, "docs", "roles", entry)) });
-    }
-  }
-  const memoryDir = join2(root, ".memory");
-  for (const entry of readdirSync2(memoryDir, { recursive: true })) {
-    if (!entry.endsWith(".md")) continue;
-    const rel = entry.replaceAll("\\", "/");
-    if (FILE_MAP.some((m) => m.from === `.memory/${rel}`)) continue;
-    if (rel.startsWith("roles/")) continue;
-    if (rel === "index.md") {
-      report.reviewManually.push(".memory/index.md");
+  for (const u of UPGRADE_MOVE) {
+    const fromAbs = join2(root, u.from);
+    if (!isFile(fromAbs)) continue;
+    const toAbs = join2(root, u.to);
+    if (isFile(toAbs)) {
+      report.reviewManually.push(`${u.from} (target ${u.to} already exists)`);
       continue;
     }
-    actions.push({ from: `.memory/${rel}`, to: `docs/memory/${rel}`, merged: isFile(join2(root, "docs", "memory", rel)) });
+    report.moved.push({ from: u.from, to: u.to });
+    report.targetsEnabled.push(u.target);
+    if (apply) {
+      moveFile(fromAbs, toAbs);
+      setTarget(db, u.target, { enabled: true, path: u.to });
+    }
+  }
+  const actions = [];
+  if (report.memoryDirFound) {
+    for (const m of FILE_MAP) {
+      const fromAbs = join2(root, m.from);
+      if (isFile(fromAbs)) {
+        const targetAbs = join2(root, m.to);
+        const merged = isFile(targetAbs);
+        actions.push({ from: m.from, to: m.to, merged, renumber: m.renumber && merged, target: m.target });
+        if (m.target && !report.targetsEnabled.includes(m.target)) report.targetsEnabled.push(m.target);
+      }
+    }
+    const rolesDir = join2(root, ".memory", "roles");
+    if (isDir(rolesDir)) {
+      for (const entry of readdirSync2(rolesDir)) {
+        if (!entry.endsWith(".md")) continue;
+        actions.push({ from: `.memory/roles/${entry}`, to: `docs/roles/${entry}`, merged: isFile(join2(root, "docs", "roles", entry)) });
+      }
+    }
+    const memoryDir = join2(root, ".memory");
+    for (const entry of readdirSync2(memoryDir, { recursive: true })) {
+      if (!entry.endsWith(".md")) continue;
+      const rel = entry.replaceAll("\\", "/");
+      if (FILE_MAP.some((m) => m.from === `.memory/${rel}`)) continue;
+      if (rel.startsWith("roles/")) continue;
+      if (rel === "index.md") {
+        report.reviewManually.push(".memory/index.md");
+        continue;
+      }
+      actions.push({ from: `.memory/${rel}`, to: `docs/memory/${rel}`, merged: isFile(join2(root, "docs", "memory", rel)) });
+    }
   }
   const agentsAbs = join2(root, "AGENTS.md");
   const agentsText = isFile(agentsAbs) ? readFileSync2(agentsAbs, "utf8") : "";
   report.agentsUpdated = !/^##\s+Documentation\b/m.test(agentsText);
+  const touched = report.moved.length > 0 || actions.length > 0;
   if (apply) {
     for (const a of actions) {
       const fromAbs = join2(root, a.from);
@@ -13439,10 +13596,20 @@ function migrateMemoryDir(db, root, apply = false) {
       } else {
         writeFileSync2(toAbs, source);
       }
+      if (a.target) {
+        setTarget(db, a.target, { enabled: true, path: a.to });
+      }
       report.copied.push({ from: a.from, to: a.to, merged: a.merged });
     }
-    if (report.agentsUpdated) {
-      const docLinks = ["docs/decisions.md", "docs/gotchas.md", "docs/Changelog.md", "docs/context.md", "docs/roles"].filter((rel) => existsSync2(join2(root, rel))).map((rel) => `- [${rel}](./${rel})`).join("\n");
+    if (report.agentsUpdated && touched) {
+      const docLinks = [
+        "docs/hw-memory/decisions.md",
+        "docs/hw-memory/gotchas.md",
+        "docs/hw-memory/debt.md",
+        "docs/Changelog.md",
+        "docs/context.md",
+        "docs/roles"
+      ].filter((rel) => existsSync2(join2(root, rel))).map((rel) => `- [${rel}](./${rel})`).join("\n");
       const section = `
 ## Documentation
 
@@ -13450,8 +13617,8 @@ ${docLinks}
 `;
       writeFileSync2(agentsAbs, (agentsText.endsWith("\n") ? agentsText : agentsText + "\n") + section);
     }
-    report.reviewManually.push(".memory (remove manually after review)");
-    report.seed = seedFromDocs(db, root);
+    if (report.memoryDirFound) report.reviewManually.push(".memory (remove manually after review)");
+    if (touched) report.seed = seedFromDocs(db, root);
   } else {
     for (const a of actions) report.copied.push({ from: a.from, to: a.to, merged: a.merged });
   }
@@ -13468,12 +13635,14 @@ function formatFacts(rows) {
 }
 function makeTools(root, db) {
   const memoryAdd = defineTool({
-    description: "Store a durable project fact into hw-memory. One fact per call. Crucial facts (kind decision/gotcha or rank critical/high) are also appended to docs/ markdown automatically. Use for: pinned decisions, resolved pitfalls, project constraints.",
+    description: "Store a durable project fact into hw-memory. One fact per call. Managed kinds (decision/gotcha/debt) are also written to their managed markdown file when that entity is enabled. Use for: pinned decisions, resolved pitfalls, technical debt, project constraints.",
     args: {
       content: external_exports.string().describe("One dense fact, single sentence or two. Language-agnostic."),
       keywords: external_exports.string().optional().describe("3-6 comma-separated terms that boost keyword search."),
-      kind: external_exports.enum(["decision", "gotcha", "error", "dependency", "fact", "changelog"]).optional().describe("Fact category. decision and gotcha are written to docs/."),
-      rank: external_exports.enum(["critical", "high", "medium", "low"]).optional().describe("critical: never fades. high: slow decay, never pruned. medium: default. low: fades fast.")
+      kind: external_exports.enum(["decision", "gotcha", "debt", "error", "dependency", "fact", "changelog"]).optional().describe("Fact category. decision/gotcha/debt are also written to their managed file when enabled."),
+      rank: external_exports.enum(["critical", "high", "medium", "low"]).optional().describe(
+        "critical: never fades. high: slow decay, never pruned. medium: default. low: fades fast. Debt is clamped to medium..critical."
+      )
     },
     async execute(args) {
       const res = addFact(db, {
@@ -13484,21 +13653,12 @@ function makeTools(root, db) {
         source: "agent"
       });
       let note = "";
-      if (res.status === "inserted" && res.crucial) {
-        const fact = getFact(db, res.id);
-        const written = writeCrucialToDocs(root, {
-          id: res.id,
-          content: fact.content,
-          keywords: fact.keywords ? fact.keywords.split(",") : [],
-          kind: res.kind,
-          rank: res.rank
-        });
-        if (written.written) {
-          updateOrigin(db, res.id, written.origin);
-          note = ` Also appended to ${written.file}.`;
-        }
+      if (res.status === "inserted" && isManagedKind(res.kind)) {
+        const sync = syncEntityToFile(db, root, res.kind);
+        if (sync.written > 0) note = ` Also written to ${sync.file}.`;
       }
-      return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}`;
+      const debtNote = res.kind === "debt" ? " \u26A0 Technical debt recorded \u2014 tell the user about it before finishing the task." : "";
+      return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}${debtNote}`;
     }
   });
   const memorySearch = defineTool({
@@ -13524,9 +13684,11 @@ function makeTools(root, db) {
         `by rank: ${JSON.stringify(stats.byRank)}`,
         `by kind: ${JSON.stringify(stats.byKind)}`,
         `by source: ${JSON.stringify(stats.bySource)}`,
+        `open debt: ${stats.debt}`,
         `avg weight: ${stats.avgWeight.toFixed(3)}`,
         `db: ${join3(root, ".opencode", "hw-memory.db")}`,
-        `docs: ${docsFooterLines(root).join("; ") || "none"}`
+        `files: ${listTargets(db).map((t) => `${t.kind}=${t.enabled ? t.path : "off"}`).join("; ")}`,
+        `docs: ${docsFooterLines(root, db).join("; ") || "none"}`
       ];
       return lines.join("\n");
     }
@@ -13557,13 +13719,19 @@ function makeTools(root, db) {
     }
   });
   const memoryMigrate = defineTool({
-    description: "Migrate legacy .memory/ folder into docs/ layout, then seed the DB. Direct user command only. Default dry-run; apply=true executes. Never deletes .memory/ \u2014 user removes it manually.",
+    description: "Migrate a legacy .memory/ folder and/or upgrade legacy docs/decisions.md + docs/gotchas.md to the managed docs/hw-memory/ layout, then seed the DB. Direct user command only. Default dry-run; apply=true executes. Never deletes .memory/ \u2014 user removes it manually.",
     args: { apply: external_exports.boolean().optional().describe("Apply migration. Default false (dry-run plan).") },
     async execute(args) {
       const report = migrateMemoryDir(db, root, args.apply ?? false);
-      if (!report.memoryDirFound) return "No .memory/ folder found.";
+      if (!report.memoryDirFound && report.moved.length === 0 && report.copied.length === 0) {
+        return "Nothing to migrate: no .memory/ folder and no legacy docs/decisions.md or docs/gotchas.md.";
+      }
       const lines = [`${report.apply ? "APPLIED" : "DRY-RUN"} migration:`];
+      for (const m of report.moved) lines.push(`- move ${m.from} -> ${m.to}`);
       for (const c of report.copied) lines.push(`- ${c.from} -> ${c.to}${c.merged ? " (merge into existing)" : ""}`);
+      if (report.targetsEnabled.length > 0) {
+        lines.push(`- enable managed files: ${report.targetsEnabled.join(", ")}`);
+      }
       if (report.agentsUpdated) lines.push(`- append "## Documentation" section to AGENTS.md`);
       for (const r of report.reviewManually) lines.push(`- review manually: ${r}`);
       if (report.apply && report.seed) {
@@ -13572,13 +13740,83 @@ function makeTools(root, db) {
       return lines.join("\n");
     }
   });
+  const memoryDebt = defineTool({
+    description: "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id removes it (and its line from the managed debt file when enabled). Always tell the user about new debt before finishing a task.",
+    args: {
+      action: external_exports.enum(["list", "resolve"]).optional().describe("list (default) or resolve."),
+      id: external_exports.number().optional().describe("Debt id to resolve.")
+    },
+    async execute(args) {
+      if (args.action === "resolve") {
+        if (args.id == null) return "Provide the debt id to resolve.";
+        const fact = resolveDebt(db, args.id);
+        if (!fact) return `#${args.id} is not an open debt item.`;
+        const target = getTarget(db, "debt");
+        if (target.enabled) removeEntityLine(root, target.path, fact.content);
+        return `Resolved and removed debt #${args.id}.`;
+      }
+      const rows = listDebt(db);
+      if (rows.length === 0) return "No open technical debt.";
+      return rows.map((f) => `#${f.id} [${f.rank}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`).join("\n");
+    }
+  });
+  const memoryConfig = defineTool({
+    description: "Get or set hw-memory managed-file targets. decision, gotcha and debt can each be enabled/disabled and pointed at a repo-relative .md path (default docs/hw-memory/<entity>.md). Disabled means facts live only in the DB.",
+    args: {
+      entity: external_exports.enum(["decision", "gotcha", "debt"]).optional().describe("Entity to configure; omit to list all."),
+      enabled: external_exports.boolean().optional().describe("Enable or disable write-back for the entity."),
+      path: external_exports.string().optional().describe("Repo-relative .md path for the entity.")
+    },
+    async execute(args) {
+      if (!args.entity) {
+        return listTargets(db).map((t2) => `${t2.kind}: ${t2.enabled ? "enabled" : "disabled"} -> ${t2.path}`).join("\n");
+      }
+      if (args.path !== void 0 && !isSafeRelPath(args.path)) {
+        return `Invalid path: ${args.path}. Use a repo-relative path without "..".`;
+      }
+      const t = setTarget(db, args.entity, { enabled: args.enabled, path: args.path });
+      return `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`;
+    }
+  });
+  const memoryFile = defineTool({
+    description: "Attach or sync a managed markdown file for decision/gotcha/debt. With file, sets it as the entity target and enables write-back. By default appends the entity's facts that are missing from the file, leaving existing content untouched. rework=true also reads the existing file and adds its content to the entity in the DB (for pre-existing memoirs outside docs/).",
+    args: {
+      kind: external_exports.enum(["decision", "gotcha", "debt"]).describe("Entity to write."),
+      file: external_exports.string().optional().describe("Repo-relative .md path; persists as the entity target and enables write-back."),
+      rework: external_exports.boolean().optional().describe("Read the existing file into the entity before appending.")
+    },
+    async execute(args) {
+      const kind = args.kind;
+      if (args.file !== void 0 && !isSafeRelPath(args.file)) {
+        return `Invalid file: ${args.file}. Use a repo-relative path without "..".`;
+      }
+      if (args.file) setTarget(db, kind, { path: args.file, enabled: true });
+      const target = getTarget(db, kind);
+      const rel = args.file ?? target.path;
+      const abs = join3(root, rel);
+      let reworkNote = "";
+      if (args.rework) {
+        if (isFile(abs)) {
+          const r = reworkFileIntoDb(db, root, kind, rel);
+          reworkNote = ` Reworked ${rel}: facts=${r.facts} inserted=${r.inserted} updated=${r.updated}.`;
+        } else {
+          reworkNote = ` Rework skipped: ${rel} does not exist.`;
+        }
+      }
+      const sync = syncEntityToFile(db, root, kind);
+      return `${rel}: appended=${sync.written}.${reworkNote}`;
+    }
+  });
   return {
     hw_memory_add: memoryAdd,
     hw_memory_search: memorySearch,
     hw_memory_stats: memoryStats,
     hw_memory_forget: memoryForget,
     hw_memory_seed: memorySeed,
-    hw_memory_migrate: memoryMigrate
+    hw_memory_migrate: memoryMigrate,
+    hw_memory_debt: memoryDebt,
+    hw_memory_config: memoryConfig,
+    hw_memory_file: memoryFile
   };
 }
 var HwMemoryPlugin = async ({ directory, worktree, client }) => {
@@ -13601,21 +13839,14 @@ var HwMemoryPlugin = async ({ directory, worktree, client }) => {
     const fact = getFact(db, id);
     if (!fact || fact.kind !== "error") return;
     db.prepare("UPDATE memories SET kind = 'gotcha', rank = 'high', weight = 1.0, last_verified_at = ? WHERE id = ?").run((/* @__PURE__ */ new Date()).toISOString(), id);
-    const updated = getFact(db, id);
-    const written = writeCrucialToDocs(root, {
-      id,
-      content: updated.content,
-      keywords: updated.keywords ? updated.keywords.split(",") : [],
-      kind: "gotcha",
-      rank: "high"
-    });
-    if (written.written) updateOrigin(db, id, written.origin);
+    const sync = syncEntityToFile(db, root, "gotcha");
+    if (sync.written > 0 && sync.origin) updateOrigin(db, id, sync.origin);
   };
   return {
     "experimental.chat.system.transform": async (_input, output) => {
       try {
         maintain(db);
-        output.system.push(wakeUpPack(db, docsFooterLines(root)));
+        output.system.push(wakeUpPack(db, docsFooterLines(root, db)));
       } catch (e) {
         console.error("hw-memory wake-up failed:", e);
       }

@@ -1,14 +1,17 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import type { DB } from "./db.ts"
 import { seedFromDocs, type SeedReport } from "./docs.ts"
 import { isDir, isFile } from "./fs.ts"
+import { setTarget, type ManagedKind } from "./config.ts"
 import { todayISO } from "./util.ts"
 
 export interface MigrateReport {
   apply: boolean
   memoryDirFound: boolean
   copied: { from: string; to: string; merged: boolean }[]
+  moved: { from: string; to: string }[]
+  targetsEnabled: ManagedKind[]
   renumbered: boolean
   reviewManually: string[]
   agentsUpdated: boolean
@@ -19,13 +22,19 @@ interface Mapping {
   from: string
   to: string
   renumber?: boolean
+  target?: ManagedKind
 }
 
 const FILE_MAP: Mapping[] = [
-  { from: ".memory/history/decisions.md", to: "docs/decisions.md", renumber: true },
-  { from: ".memory/ai/gotchas.md", to: "docs/gotchas.md" },
+  { from: ".memory/history/decisions.md", to: "docs/hw-memory/decisions.md", renumber: true, target: "decision" },
+  { from: ".memory/ai/gotchas.md", to: "docs/hw-memory/gotchas.md", target: "gotcha" },
   { from: ".memory/ai/context.md", to: "docs/context.md" },
   { from: ".memory/history/changelog.md", to: "docs/Changelog.md" },
+]
+
+const UPGRADE_MOVE: { from: string; to: string; target: ManagedKind }[] = [
+  { from: "docs/decisions.md", to: "docs/hw-memory/decisions.md", target: "decision" },
+  { from: "docs/gotchas.md", to: "docs/hw-memory/gotchas.md", target: "gotcha" },
 ]
 
 function maxDecisionNumber(text: string): number {
@@ -46,48 +55,83 @@ function appendMerged(target: string, source: string, renumber: boolean): string
   return `${base}\n## Migrated from .memory (${todayISO()})\n\n${body}\n`
 }
 
+function moveFile(fromAbs: string, toAbs: string): void {
+  mkdirSync(dirname(toAbs), { recursive: true })
+  try {
+    rmSync(toAbs, { force: true })
+    writeFileSync(toAbs, readFileSync(fromAbs, "utf8"))
+    rmSync(fromAbs, { force: true })
+  } catch {
+    writeFileSync(toAbs, readFileSync(fromAbs, "utf8"))
+  }
+}
+
 export function migrateMemoryDir(db: DB, root: string, apply = false): MigrateReport {
   const report: MigrateReport = {
     apply,
     memoryDirFound: isDir(join(root, ".memory")),
     copied: [],
+    moved: [],
+    targetsEnabled: [],
     renumbered: false,
     reviewManually: [],
     agentsUpdated: false,
     seed: null,
   }
-  if (!report.memoryDirFound) return report
-  const actions: { from: string; to: string; merged: boolean; renumber?: boolean }[] = []
-  for (const m of FILE_MAP) {
-    const fromAbs = join(root, m.from)
-    if (isFile(fromAbs)) {
-      const targetAbs = join(root, m.to)
-      const merged = isFile(targetAbs)
-      actions.push({ from: m.from, to: m.to, merged, renumber: m.renumber && merged })
-    }
-  }
-  const rolesDir = join(root, ".memory", "roles")
-  if (isDir(rolesDir)) {
-    for (const entry of readdirSync(rolesDir) as string[]) {
-      if (!entry.endsWith(".md")) continue
-      actions.push({ from: `.memory/roles/${entry}`, to: `docs/roles/${entry}`, merged: isFile(join(root, "docs", "roles", entry)) })
-    }
-  }
-  const memoryDir = join(root, ".memory")
-  for (const entry of readdirSync(memoryDir, { recursive: true }) as string[]) {
-    if (!entry.endsWith(".md")) continue
-    const rel = entry.replaceAll("\\", "/")
-    if (FILE_MAP.some((m) => m.from === `.memory/${rel}`)) continue
-    if (rel.startsWith("roles/")) continue
-    if (rel === "index.md") {
-      report.reviewManually.push(".memory/index.md")
+
+  for (const u of UPGRADE_MOVE) {
+    const fromAbs = join(root, u.from)
+    if (!isFile(fromAbs)) continue
+    const toAbs = join(root, u.to)
+    if (isFile(toAbs)) {
+      report.reviewManually.push(`${u.from} (target ${u.to} already exists)`)
       continue
     }
-    actions.push({ from: `.memory/${rel}`, to: `docs/memory/${rel}`, merged: isFile(join(root, "docs", "memory", rel)) })
+    report.moved.push({ from: u.from, to: u.to })
+    report.targetsEnabled.push(u.target)
+    if (apply) {
+      moveFile(fromAbs, toAbs)
+      setTarget(db, u.target, { enabled: true, path: u.to })
+    }
   }
+
+  const actions: { from: string; to: string; merged: boolean; renumber?: boolean; target?: ManagedKind }[] = []
+  if (report.memoryDirFound) {
+    for (const m of FILE_MAP) {
+      const fromAbs = join(root, m.from)
+      if (isFile(fromAbs)) {
+        const targetAbs = join(root, m.to)
+        const merged = isFile(targetAbs)
+        actions.push({ from: m.from, to: m.to, merged, renumber: m.renumber && merged, target: m.target })
+        if (m.target && !report.targetsEnabled.includes(m.target)) report.targetsEnabled.push(m.target)
+      }
+    }
+    const rolesDir = join(root, ".memory", "roles")
+    if (isDir(rolesDir)) {
+      for (const entry of readdirSync(rolesDir) as string[]) {
+        if (!entry.endsWith(".md")) continue
+        actions.push({ from: `.memory/roles/${entry}`, to: `docs/roles/${entry}`, merged: isFile(join(root, "docs", "roles", entry)) })
+      }
+    }
+    const memoryDir = join(root, ".memory")
+    for (const entry of readdirSync(memoryDir, { recursive: true }) as string[]) {
+      if (!entry.endsWith(".md")) continue
+      const rel = entry.replaceAll("\\", "/")
+      if (FILE_MAP.some((m) => m.from === `.memory/${rel}`)) continue
+      if (rel.startsWith("roles/")) continue
+      if (rel === "index.md") {
+        report.reviewManually.push(".memory/index.md")
+        continue
+      }
+      actions.push({ from: `.memory/${rel}`, to: `docs/memory/${rel}`, merged: isFile(join(root, "docs", "memory", rel)) })
+    }
+  }
+
   const agentsAbs = join(root, "AGENTS.md")
   const agentsText = isFile(agentsAbs) ? readFileSync(agentsAbs, "utf8") : ""
   report.agentsUpdated = !/^##\s+Documentation\b/m.test(agentsText)
+
+  const touched = report.moved.length > 0 || actions.length > 0
   if (apply) {
     for (const a of actions) {
       const fromAbs = join(root, a.from)
@@ -100,18 +144,28 @@ export function migrateMemoryDir(db: DB, root: string, apply = false): MigrateRe
       } else {
         writeFileSync(toAbs, source)
       }
+      if (a.target) {
+        setTarget(db, a.target, { enabled: true, path: a.to })
+      }
       report.copied.push({ from: a.from, to: a.to, merged: a.merged })
     }
-    if (report.agentsUpdated) {
-      const docLinks = ["docs/decisions.md", "docs/gotchas.md", "docs/Changelog.md", "docs/context.md", "docs/roles"]
+    if (report.agentsUpdated && touched) {
+      const docLinks = [
+        "docs/hw-memory/decisions.md",
+        "docs/hw-memory/gotchas.md",
+        "docs/hw-memory/debt.md",
+        "docs/Changelog.md",
+        "docs/context.md",
+        "docs/roles",
+      ]
         .filter((rel) => existsSync(join(root, rel)))
         .map((rel) => `- [${rel}](./${rel})`)
         .join("\n")
       const section = `\n## Documentation\n\n${docLinks}\n`
       writeFileSync(agentsAbs, (agentsText.endsWith("\n") ? agentsText : agentsText + "\n") + section)
     }
-    report.reviewManually.push(".memory (remove manually after review)")
-    report.seed = seedFromDocs(db, root)
+    if (report.memoryDirFound) report.reviewManually.push(".memory (remove manually after review)")
+    if (touched) report.seed = seedFromDocs(db, root)
   } else {
     for (const a of actions) report.copied.push({ from: a.from, to: a.to, merged: a.merged })
   }
