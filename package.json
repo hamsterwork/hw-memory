@@ -6,7 +6,9 @@
   "scripts": {
     "test": "node --test 'test/*.test.ts'",
     "test:install": "bash scripts/test-install.sh",
-    "build": "esbuild src/hw-memory.ts --bundle --format=esm --platform=neutral --external:bun:sqlite --external:node:* --outfile=plugin/hw-memory.ts",
+    "test:update": "bash scripts/test-update.sh",
+    "build": "node scripts/build.mjs",
+    "update": "bash update.sh",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

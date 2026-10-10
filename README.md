@@ -41,6 +41,31 @@ the active rules file — between `<!-- hw-memory:start -->` and
 never duplicates it. Then restart opencode. The DB is created at
 `.opencode/hw-memory.db` and is gitignored automatically by `install.sh`.
 
+## Update
+
+Each released plugin carries a `// hw-memory vX.Y.Z` banner. `update.sh` reads
+the installed version, compares it against the latest GitHub release, and — only
+with your confirmation — downloads the verified release over it (keeping a
+`.bak` next to the plugin).
+
+```sh
+# check and update a project install (run from the project root)
+curl -fsSL https://raw.githubusercontent.com/hamsterwork/hw-memory/main/update.sh | bash
+
+# global install
+curl -fsSL .../update.sh | bash -s -- --global
+
+# report only, change nothing (exit 1 when an update is available)
+curl -fsSL .../update.sh | bash -s -- --check
+```
+
+From a clone, run `./update.sh [target-dir]`, `./update.sh --global`, or
+`npm run update`. Flags mirror `install.sh`: `--version vX.Y.Z`, `--base-url`,
+`--no-rules`, plus `--yes` (non-interactive) and `--check`. The rules block is
+refreshed unless `--no-rules` is given. Assets are verified against the release
+`SHA256SUMS` before anything is written.
+
+
 ## Database files
 
 On first tool use the plugin creates three files in `<project>/.opencode/` — even
@@ -75,9 +100,10 @@ while the DB is open loses the writes it still holds.
 
 ```sh
 npm install
-npm test              # node --test, 63 tests
+npm test              # node --test, 67 tests
 npm run test:install  # installer tests: project/global, AGENTS.md/CLAUDE.md, SHA256
-npm run build         # bundles src/hw-memory.ts -> plugin/hw-memory.ts (single file, zod inlined)
+npm run test:update   # updater tests: version detection, --check, verified update
+npm run build         # bundles src/hw-memory.ts -> plugin/hw-memory.ts (single file, zod inlined, version banner)
 npm run typecheck
 ```
 
