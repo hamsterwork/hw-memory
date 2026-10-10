@@ -1,4 +1,4 @@
-// hw-memory v0.2.0
+// hw-memory v0.3.0
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -6,7 +6,7 @@ var __export = (target, all) => {
 };
 
 // src/hw-memory.ts
-import { join as join3 } from "node:path";
+import { join as join2 } from "node:path";
 
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -12456,11 +12456,6 @@ var DEFAULT_TARGET_PATH = {
 function isManagedKind(kind) {
   return MANAGED_KINDS.includes(kind);
 }
-function isSafeRelPath(path) {
-  if (!path || path.startsWith("/") || path.startsWith("\\")) return false;
-  if (/^[A-Za-z]:[\\/]/.test(path)) return false;
-  return !path.replaceAll("\\", "/").split("/").includes("..");
-}
 function ensureFileTargets(db) {
   for (const kind of MANAGED_KINDS) {
     db.prepare("INSERT OR IGNORE INTO file_targets (kind, enabled, path) VALUES (?, 0, ?)").run(
@@ -13035,7 +13030,7 @@ function managedRank(kind) {
 }
 function rankForPath(rel) {
   const p = rel.replaceAll("\\", "/").toLowerCase();
-  if (p.startsWith(".memory/") || p.startsWith(".opencode/") || p.startsWith("node_modules/")) return null;
+  if (p.startsWith(".opencode/") || p.startsWith("node_modules/")) return null;
   const base = p.split("/").pop() ?? p;
   if (base === "decisions.md") return { kind: "decision", rank: "critical" };
   if (base === "gotchas.md") return { kind: "gotcha", rank: "high" };
@@ -13148,28 +13143,6 @@ function discoverDocFiles(root, targets = []) {
     seen.add(t.path);
   }
   return out.sort((a, b) => a.rel.localeCompare(b.rel));
-}
-function seedFromDocs(db, root) {
-  const files = discoverDocFiles(root, listTargets(db));
-  const report = { files: files.length, facts: 0, inserted: 0, updated: 0 };
-  for (const f of files) {
-    for (const doc of parseDocFile(f.abs, f.rel, f.override)) {
-      report.facts++;
-      const res = addFact(db, {
-        content: doc.content,
-        keywords: doc.keywords,
-        kind: doc.kind,
-        rank: doc.rank,
-        source: "seed",
-        origin: doc.origin,
-        verified: doc.verified ?? void 0,
-        exact: true
-      });
-      if (res.status === "inserted") report.inserted++;
-      else report.updated++;
-    }
-  }
-  return report;
 }
 function similarity(a, b) {
   let inter = 0;
@@ -13417,28 +13390,6 @@ ${f.content}
   }
   return { file: rel, written, origin };
 }
-function reworkFileIntoDb(db, root, kind, rel) {
-  const abs = join(root, rel);
-  const report = { facts: 0, inserted: 0, updated: 0 };
-  if (!isFile(abs)) return report;
-  const rank = managedRank(kind);
-  for (const doc of parseDocFile(abs, rel, { kind, rank })) {
-    report.facts++;
-    const res = addFact(db, {
-      content: doc.content,
-      keywords: doc.keywords,
-      kind: doc.kind,
-      rank: doc.rank,
-      source: "seed",
-      origin: doc.origin,
-      verified: doc.verified ?? void 0,
-      exact: true
-    });
-    if (res.status === "inserted") report.inserted++;
-    else report.updated++;
-  }
-  return report;
-}
 function removeEntityLine(root, rel, content) {
   const abs = join(root, rel);
   if (!isFile(abs)) return false;
@@ -13564,151 +13515,6 @@ var SessionTracker = class {
   }
 };
 
-// src/migrate.ts
-import { existsSync as existsSync2, mkdirSync as mkdirSync3, readFileSync as readFileSync2, readdirSync as readdirSync2, rmSync, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname2, join as join2 } from "node:path";
-var FILE_MAP = [
-  { from: ".memory/history/decisions.md", to: "docs/hw-memory/decisions.md", renumber: true, target: "decision" },
-  { from: ".memory/ai/gotchas.md", to: "docs/hw-memory/gotchas.md", target: "gotcha" },
-  { from: ".memory/ai/context.md", to: "docs/context.md" },
-  { from: ".memory/history/changelog.md", to: "docs/Changelog.md" }
-];
-var UPGRADE_MOVE = [
-  { from: "docs/decisions.md", to: "docs/hw-memory/decisions.md", target: "decision" },
-  { from: "docs/gotchas.md", to: "docs/hw-memory/gotchas.md", target: "gotcha" }
-];
-function maxDecisionNumber(text) {
-  let max = 0;
-  for (const m of text.matchAll(/^(\d+)[.)]\s+/gm)) max = Math.max(max, Number(m[1]));
-  return max;
-}
-function renumberTopLevel(text, start) {
-  let n = start;
-  return text.replace(/^(\d+)[.)](\s+)/gm, () => `${++n}. `);
-}
-function appendMerged(target, source, renumber) {
-  const base = target.endsWith("\n") ? target : target + "\n";
-  let body = source.trim();
-  if (renumber) body = renumberTopLevel(body, maxDecisionNumber(target));
-  return `${base}
-## Migrated from .memory (${todayISO()})
-
-${body}
-`;
-}
-function moveFile(fromAbs, toAbs) {
-  mkdirSync3(dirname2(toAbs), { recursive: true });
-  try {
-    rmSync(toAbs, { force: true });
-    writeFileSync2(toAbs, readFileSync2(fromAbs, "utf8"));
-    rmSync(fromAbs, { force: true });
-  } catch {
-    writeFileSync2(toAbs, readFileSync2(fromAbs, "utf8"));
-  }
-}
-function migrateMemoryDir(db, root, apply = false) {
-  const report = {
-    apply,
-    memoryDirFound: isDir(join2(root, ".memory")),
-    copied: [],
-    moved: [],
-    targetsEnabled: [],
-    renumbered: false,
-    reviewManually: [],
-    agentsUpdated: false,
-    seed: null
-  };
-  for (const u of UPGRADE_MOVE) {
-    const fromAbs = join2(root, u.from);
-    if (!isFile(fromAbs)) continue;
-    const toAbs = join2(root, u.to);
-    if (isFile(toAbs)) {
-      report.reviewManually.push(`${u.from} (target ${u.to} already exists)`);
-      continue;
-    }
-    report.moved.push({ from: u.from, to: u.to });
-    report.targetsEnabled.push(u.target);
-    if (apply) {
-      moveFile(fromAbs, toAbs);
-      setTarget(db, u.target, { enabled: true, path: u.to });
-    }
-  }
-  const actions = [];
-  if (report.memoryDirFound) {
-    for (const m of FILE_MAP) {
-      const fromAbs = join2(root, m.from);
-      if (isFile(fromAbs)) {
-        const targetAbs = join2(root, m.to);
-        const merged = isFile(targetAbs);
-        actions.push({ from: m.from, to: m.to, merged, renumber: m.renumber && merged, target: m.target });
-        if (m.target && !report.targetsEnabled.includes(m.target)) report.targetsEnabled.push(m.target);
-      }
-    }
-    const rolesDir = join2(root, ".memory", "roles");
-    if (isDir(rolesDir)) {
-      for (const entry of readdirSync2(rolesDir)) {
-        if (!entry.endsWith(".md")) continue;
-        actions.push({ from: `.memory/roles/${entry}`, to: `docs/roles/${entry}`, merged: isFile(join2(root, "docs", "roles", entry)) });
-      }
-    }
-    const memoryDir = join2(root, ".memory");
-    for (const entry of readdirSync2(memoryDir, { recursive: true })) {
-      if (!entry.endsWith(".md")) continue;
-      const rel = entry.replaceAll("\\", "/");
-      if (FILE_MAP.some((m) => m.from === `.memory/${rel}`)) continue;
-      if (rel.startsWith("roles/")) continue;
-      if (rel === "index.md") {
-        report.reviewManually.push(".memory/index.md");
-        continue;
-      }
-      actions.push({ from: `.memory/${rel}`, to: `docs/memory/${rel}`, merged: isFile(join2(root, "docs", "memory", rel)) });
-    }
-  }
-  const agentsAbs = join2(root, "AGENTS.md");
-  const agentsText = isFile(agentsAbs) ? readFileSync2(agentsAbs, "utf8") : "";
-  report.agentsUpdated = !/^##\s+Documentation\b/m.test(agentsText);
-  const touched = report.moved.length > 0 || actions.length > 0;
-  if (apply) {
-    for (const a of actions) {
-      const fromAbs = join2(root, a.from);
-      const toAbs = join2(root, a.to);
-      mkdirSync3(dirname2(toAbs), { recursive: true });
-      const source = readFileSync2(fromAbs, "utf8");
-      if (a.merged) {
-        writeFileSync2(toAbs, appendMerged(readFileSync2(toAbs, "utf8"), source, a.renumber ?? false));
-        if (a.renumber) report.renumbered = true;
-      } else {
-        writeFileSync2(toAbs, source);
-      }
-      if (a.target) {
-        setTarget(db, a.target, { enabled: true, path: a.to });
-      }
-      report.copied.push({ from: a.from, to: a.to, merged: a.merged });
-    }
-    if (report.agentsUpdated && touched) {
-      const docLinks = [
-        "docs/hw-memory/decisions.md",
-        "docs/hw-memory/gotchas.md",
-        "docs/hw-memory/debt.md",
-        "docs/Changelog.md",
-        "docs/context.md",
-        "docs/roles"
-      ].filter((rel) => existsSync2(join2(root, rel))).map((rel) => `- [${rel}](./${rel})`).join("\n");
-      const section = `
-## Documentation
-
-${docLinks}
-`;
-      writeFileSync2(agentsAbs, (agentsText.endsWith("\n") ? agentsText : agentsText + "\n") + section);
-    }
-    if (report.memoryDirFound) report.reviewManually.push(".memory (remove manually after review)");
-    if (touched) report.seed = seedFromDocs(db, root);
-  } else {
-    for (const a of actions) report.copied.push({ from: a.from, to: a.to, merged: a.merged });
-  }
-  return report;
-}
-
 // src/hw-memory.ts
 function defineTool(t) {
   return t;
@@ -13770,7 +13576,7 @@ function makeTools(root, db) {
         `by source: ${JSON.stringify(stats.bySource)}`,
         `open debt: ${stats.debt}`,
         `avg weight: ${stats.avgWeight.toFixed(3)}`,
-        `db: ${join3(root, ".opencode", "hw-memory.db")}`,
+        `db: ${join2(root, ".opencode", "hw-memory.db")}`,
         `files: ${listTargets(db).map((t) => `${t.kind}=${t.enabled ? t.path : "off"}`).join("; ")}`,
         `docs: ${docsFooterLines(root, db).join("; ") || "none"}`
       ];
@@ -13802,28 +13608,6 @@ function makeTools(root, db) {
       return lines.join("\n");
     }
   });
-  const memoryMigrate = defineTool({
-    description: "Migrate a legacy .memory/ folder and/or upgrade legacy docs/decisions.md + docs/gotchas.md to the managed docs/hw-memory/ layout, then seed the DB. Direct user command only. Default dry-run; apply=true executes. Never deletes .memory/ \u2014 user removes it manually.",
-    args: { apply: external_exports.boolean().optional().describe("Apply migration. Default false (dry-run plan).") },
-    async execute(args) {
-      const report = migrateMemoryDir(db, root, args.apply ?? false);
-      if (!report.memoryDirFound && report.moved.length === 0 && report.copied.length === 0) {
-        return "Nothing to migrate: no .memory/ folder and no legacy docs/decisions.md or docs/gotchas.md.";
-      }
-      const lines = [`${report.apply ? "APPLIED" : "DRY-RUN"} migration:`];
-      for (const m of report.moved) lines.push(`- move ${m.from} -> ${m.to}`);
-      for (const c of report.copied) lines.push(`- ${c.from} -> ${c.to}${c.merged ? " (merge into existing)" : ""}`);
-      if (report.targetsEnabled.length > 0) {
-        lines.push(`- enable managed files: ${report.targetsEnabled.join(", ")}`);
-      }
-      if (report.agentsUpdated) lines.push(`- append "## Documentation" section to AGENTS.md`);
-      for (const r of report.reviewManually) lines.push(`- review manually: ${r}`);
-      if (report.apply && report.seed) {
-        lines.push("", `seed: files=${report.seed.files} inserted=${report.seed.inserted} updated=${report.seed.updated}`);
-      }
-      return lines.join("\n");
-    }
-  });
   const memoryDebt = defineTool({
     description: "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id removes it (and its line from the managed debt file when enabled). Always tell the user about new debt before finishing a task.",
     args: {
@@ -13845,50 +13629,17 @@ function makeTools(root, db) {
     }
   });
   const memoryConfig = defineTool({
-    description: "Get or set hw-memory managed-file targets. decision, gotcha and debt can each be enabled/disabled and pointed at a repo-relative .md path (default docs/hw-memory/<entity>.md). Disabled means facts live only in the DB.",
+    description: "Get or set hw-memory managed-file write-back. decision, gotcha and debt can each be enabled/disabled; each writes to its fixed file in docs/hw-memory/ (decisions.md, gotchas.md, debt.md). Disabled means facts live only in the DB.",
     args: {
       entity: external_exports.enum(["decision", "gotcha", "debt"]).optional().describe("Entity to configure; omit to list all."),
-      enabled: external_exports.boolean().optional().describe("Enable or disable write-back for the entity."),
-      path: external_exports.string().optional().describe("Repo-relative .md path for the entity.")
+      enabled: external_exports.boolean().optional().describe("Enable or disable write-back for the entity.")
     },
     async execute(args) {
       if (!args.entity) {
         return listTargets(db).map((t2) => `${t2.kind}: ${t2.enabled ? "enabled" : "disabled"} -> ${t2.path}`).join("\n");
       }
-      if (args.path !== void 0 && !isSafeRelPath(args.path)) {
-        return `Invalid path: ${args.path}. Use a repo-relative path without "..".`;
-      }
-      const t = setTarget(db, args.entity, { enabled: args.enabled, path: args.path });
+      const t = setTarget(db, args.entity, { enabled: args.enabled });
       return `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`;
-    }
-  });
-  const memoryFile = defineTool({
-    description: "Attach or sync a managed markdown file for decision/gotcha/debt. With file, sets it as the entity target and enables write-back. By default appends the entity's facts that are missing from the file, leaving existing content untouched. rework=true also reads the existing file and adds its content to the entity in the DB (for pre-existing memoirs outside docs/).",
-    args: {
-      kind: external_exports.enum(["decision", "gotcha", "debt"]).describe("Entity to write."),
-      file: external_exports.string().optional().describe("Repo-relative .md path; persists as the entity target and enables write-back."),
-      rework: external_exports.boolean().optional().describe("Read the existing file into the entity before appending.")
-    },
-    async execute(args) {
-      const kind = args.kind;
-      if (args.file !== void 0 && !isSafeRelPath(args.file)) {
-        return `Invalid file: ${args.file}. Use a repo-relative path without "..".`;
-      }
-      if (args.file) setTarget(db, kind, { path: args.file, enabled: true });
-      const target = getTarget(db, kind);
-      const rel = args.file ?? target.path;
-      const abs = join3(root, rel);
-      let reworkNote = "";
-      if (args.rework) {
-        if (isFile(abs)) {
-          const r = reworkFileIntoDb(db, root, kind, rel);
-          reworkNote = ` Reworked ${rel}: facts=${r.facts} inserted=${r.inserted} updated=${r.updated}.`;
-        } else {
-          reworkNote = ` Rework skipped: ${rel} does not exist.`;
-        }
-      }
-      const sync = syncEntityToFile(db, root, kind);
-      return `${rel}: appended=${sync.written}.${reworkNote}`;
     }
   });
   return {
@@ -13897,15 +13648,13 @@ function makeTools(root, db) {
     hw_memory_stats: memoryStats,
     hw_memory_forget: memoryForget,
     hw_memory_seed: memorySeed,
-    hw_memory_migrate: memoryMigrate,
     hw_memory_debt: memoryDebt,
-    hw_memory_config: memoryConfig,
-    hw_memory_file: memoryFile
+    hw_memory_config: memoryConfig
   };
 }
 var HwMemoryPlugin = async ({ directory, worktree, client }) => {
   const root = worktree || directory;
-  const db = await openDBFile(join3(root, ".opencode", "hw-memory.db"));
+  const db = await openDBFile(join2(root, ".opencode", "hw-memory.db"));
   initSchema(db);
   const tracker = new SessionTracker();
   const storeCandidate = (sessionID, candidate, origin) => {
