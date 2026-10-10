@@ -12682,6 +12682,24 @@ function promoteRank(rank, accesses) {
   if (rank === "medium" && accesses >= 8) return "high";
   return rank;
 }
+function normalizeSeedOrigins(db) {
+  const dups = db.prepare(
+    "SELECT origin FROM memories WHERE source = 'seed' AND origin IS NOT NULL GROUP BY origin HAVING COUNT(*) > 1"
+  ).all();
+  for (const d of dups) {
+    const rows = db.prepare("SELECT id, rank, accesses FROM memories WHERE source = 'seed' AND origin = ? ORDER BY id ASC").all(d.origin);
+    let survivor = rows[0];
+    for (const r of rows) {
+      const better = RANK_ORDER[r.rank] > RANK_ORDER[survivor.rank] || RANK_ORDER[r.rank] === RANK_ORDER[survivor.rank] && r.accesses > survivor.accesses;
+      if (better) survivor = r;
+    }
+    const totalAccesses = rows.reduce((sum, r) => sum + r.accesses, 0);
+    db.prepare("UPDATE memories SET accesses = ? WHERE id = ?").run(totalAccesses, survivor.id);
+    for (const r of rows) {
+      if (r.id !== survivor.id) db.prepare("DELETE FROM memories WHERE id = ?").run(r.id);
+    }
+  }
+}
 function initSchema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS memories (
@@ -12719,6 +12737,11 @@ function initSchema(db) {
     );
   `);
   ensureFileTargets(db);
+  normalizeSeedOrigins(db);
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_seed_origin
+       ON memories(origin) WHERE source = 'seed' AND origin IS NOT NULL;`
+  );
 }
 function effectiveAgeDays(row) {
   const from = row.last_verified_at && row.last_verified_at > row.created_at ? row.last_verified_at : row.created_at;
@@ -12752,10 +12775,11 @@ function getFact(db, id) {
 function countFacts(db) {
   return db.prepare("SELECT COUNT(*) AS c FROM memories").get().c;
 }
-function findSimilar(db, content, kind) {
+function findSimilar(db, content, kind, exactOnly = false) {
   const hash2 = contentHash(content);
   const exact = db.prepare("SELECT * FROM memories WHERE content_hash = ?").get(hash2);
   if (exact) return rowToFact(exact);
+  if (exactOnly) return null;
   const target = tokenSet(content);
   if (target.size === 0) return null;
   const rows = db.prepare("SELECT * FROM memories WHERE kind = ?").all(kind);
@@ -12780,7 +12804,7 @@ function addFact(db, input) {
   const content = input.content.trim().replace(/\s+/g, " ");
   const kind = input.kind ?? "fact";
   const requestedRank = kind === "debt" ? clampDebtRank(input.rank) : input.rank;
-  const dup = findSimilar(db, content, kind);
+  const dup = findSimilar(db, content, kind, input.exact ?? false);
   const now = nowISO();
   if (dup) {
     const accesses = dup.accesses + 1;
@@ -13043,6 +13067,7 @@ function parseDocFile(absPath, rel, override) {
   let contextDate = null;
   const stem = (rel.split("/").pop() ?? rel).replace(/\.md$/i, "");
   const anchorCounters = /* @__PURE__ */ new Map();
+  const usedAnchors = /* @__PURE__ */ new Set();
   for (const raw of lines) {
     const trimmed = raw.trim();
     if (/^(```|~~~)/.test(trimmed)) {
@@ -13067,12 +13092,19 @@ function parseDocFile(absPath, rel, override) {
     let anchor;
     if (numbered) {
       anchor = numbered[1];
+      if (usedAnchors.has(anchor)) {
+        const base = slugify(section || stem);
+        anchor = `${base}-${numbered[1]}`;
+        let k = 1;
+        while (usedAnchors.has(anchor)) anchor = `${base}-${numbered[1]}-${++k}`;
+      }
     } else {
       const base = slugify(section || stem);
       const n = (anchorCounters.get(base) ?? 0) + 1;
       anchorCounters.set(base, n);
       anchor = `${base}-${n}`;
     }
+    usedAnchors.add(anchor);
     const keywords = keywordsFrom(content, [stem, ...tokenize(section).slice(0, 3)]);
     facts.push({
       content,
@@ -13129,7 +13161,8 @@ function seedFromDocs(db, root) {
         rank: doc.rank,
         source: "seed",
         origin: doc.origin,
-        verified: doc.verified ?? void 0
+        verified: doc.verified ?? void 0,
+        exact: true
       });
       if (res.status === "inserted") report.inserted++;
       else report.updated++;
@@ -13145,6 +13178,21 @@ function similarity(a, b) {
   const containment = inter / Math.min(a.size, b.size);
   return Math.max(jac, containment >= 0.9 ? containment : 0);
 }
+function mergeDuplicate(db, hash2, dropId) {
+  const owner = db.prepare("SELECT id, rank, accesses FROM memories WHERE content_hash = ?").get(hash2);
+  if (!owner || owner.id === dropId) return;
+  const drop = db.prepare("SELECT rank, accesses FROM memories WHERE id = ?").get(dropId);
+  if (!drop) return;
+  const accesses = owner.accesses + drop.accesses;
+  const rank = RANK_ORDER[drop.rank] > RANK_ORDER[owner.rank] ? drop.rank : owner.rank;
+  db.prepare("UPDATE memories SET accesses = ?, rank = ?, weight = ? WHERE id = ?").run(
+    accesses,
+    rank,
+    computeWeight(rank, accesses, 0),
+    owner.id
+  );
+  db.prepare("DELETE FROM memories WHERE id = ?").run(dropId);
+}
 function reSeedFromDocs(db, root, apply = false) {
   const files = discoverDocFiles(root, listTargets(db));
   const docFacts = [];
@@ -13158,6 +13206,7 @@ function reSeedFromDocs(db, root, apply = false) {
     rebound: 0,
     demoted: 0,
     unchanged: 0,
+    merged: 0,
     missingFromDocs: []
   };
   const docByHash = /* @__PURE__ */ new Map();
@@ -13165,73 +13214,106 @@ function reSeedFromDocs(db, root, apply = false) {
   const docByOrigin = /* @__PURE__ */ new Map();
   for (const d of docFacts) if (!docByOrigin.has(d.origin)) docByOrigin.set(d.origin, d);
   const matched = /* @__PURE__ */ new Set();
-  const usedOrigins = /* @__PURE__ */ new Set();
+  const claimedOrigins = /* @__PURE__ */ new Set();
   const seedRows = db.prepare("SELECT * FROM memories WHERE source = 'seed'").all();
-  for (const r of seedRows) {
-    const row = r;
-    const byHash = docByHash.get(row.content_hash);
-    if (byHash) {
+  const plan = () => {
+    const pending = [];
+    for (const r of seedRows) {
+      const row = r;
+      const byHash = docByHash.get(row.content_hash);
+      if (!byHash) {
+        pending.push(row);
+        continue;
+      }
       matched.add(byHash.hash);
-      usedOrigins.add(byHash.origin);
+      claimedOrigins.add(byHash.origin);
       if (byHash.origin !== row.origin) {
         report.rebound++;
-        if (apply) db.prepare("UPDATE memories SET origin = ?, last_verified_at = ? WHERE id = ?").run(byHash.origin, todayISO(), row.id);
+        if (apply) {
+          db.prepare("UPDATE memories SET origin = ?, last_verified_at = ? WHERE id = ?").run(byHash.origin, todayISO(), row.id);
+        }
       } else {
         report.unchanged++;
       }
-      continue;
     }
-    const byOrigin = usedOrigins.has(row.origin ?? "") ? void 0 : docByOrigin.get(row.origin ?? "");
-    if (byOrigin) {
-      matched.add(byOrigin.hash);
-      usedOrigins.add(byOrigin.origin);
-      report.updatedContent++;
-      if (apply) {
-        db.prepare(
-          "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, last_verified_at = ? WHERE id = ?"
-        ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.verified ?? todayISO(), row.id);
+    for (const row of pending) {
+      const byOrigin = docByOrigin.get(row.origin ?? "");
+      if (byOrigin) {
+        if (matched.has(byOrigin.hash)) {
+          report.merged++;
+          if (apply) mergeDuplicate(db, byOrigin.hash, row.id);
+          continue;
+        }
+        matched.add(byOrigin.hash);
+        claimedOrigins.add(byOrigin.origin);
+        report.updatedContent++;
+        if (apply) {
+          db.prepare(
+            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, last_verified_at = ? WHERE id = ?"
+          ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.verified ?? todayISO(), row.id);
+        }
+        continue;
       }
-      continue;
+      const rowTokens = new Set(tokenize(row.content));
+      let best = null;
+      let bestScore = 0;
+      for (const d of docFacts) {
+        if (matched.has(d.hash) || d.kind !== row.kind || claimedOrigins.has(d.origin)) continue;
+        const score = similarity(rowTokens, new Set(tokenize(d.content)));
+        if (score > bestScore) {
+          bestScore = score;
+          best = d;
+        }
+      }
+      if (best && bestScore >= 0.75) {
+        matched.add(best.hash);
+        claimedOrigins.add(best.origin);
+        report.rebound++;
+        if (apply) {
+          db.prepare(
+            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, origin = ?, last_verified_at = ? WHERE id = ?"
+          ).run(best.content, best.hash, best.keywords.join(","), best.origin, best.verified ?? todayISO(), row.id);
+        }
+        continue;
+      }
+      if (row.rank === "low") {
+        report.unchanged++;
+      } else {
+        report.demoted++;
+        if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6 WHERE id = ?").run(row.id);
+      }
     }
-    const rowTokens = new Set(tokenize(row.content));
-    let best = null;
-    let bestScore = 0;
     for (const d of docFacts) {
-      if (matched.has(d.hash) || d.kind !== row.kind) continue;
-      const score = similarity(rowTokens, new Set(tokenize(d.content)));
-      if (score > bestScore) {
-        bestScore = score;
-        best = d;
-      }
-    }
-    if (best && bestScore >= 0.75) {
-      matched.add(best.hash);
-      report.rebound++;
+      if (matched.has(d.hash)) continue;
+      matched.add(d.hash);
+      if (db.prepare("SELECT 1 FROM memories WHERE content_hash = ?").get(d.hash)) continue;
+      if (db.prepare("SELECT 1 FROM memories WHERE source = 'seed' AND origin = ?").get(d.origin)) continue;
+      report.inserted++;
       if (apply) {
-        db.prepare(
-          "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, origin = ?, last_verified_at = ? WHERE id = ?"
-        ).run(best.content, best.hash, best.keywords.join(","), best.origin, best.verified ?? todayISO(), row.id);
+        addFact(db, {
+          content: d.content,
+          keywords: d.keywords,
+          kind: d.kind,
+          rank: d.rank,
+          source: "seed",
+          origin: d.origin,
+          verified: d.verified ?? void 0,
+          exact: true
+        });
       }
-      continue;
     }
-    report.demoted++;
-    if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6 WHERE id = ?").run(row.id);
-  }
-  for (const d of docFacts) {
-    if (matched.has(d.hash)) continue;
-    if (db.prepare("SELECT 1 FROM memories WHERE content_hash = ?").get(d.hash)) continue;
-    report.inserted++;
-    if (apply) {
-      addFact(db, {
-        content: d.content,
-        keywords: d.keywords,
-        kind: d.kind,
-        rank: d.rank,
-        source: "seed",
-        origin: d.origin,
-        verified: d.verified ?? void 0
-      });
+  };
+  if (apply) {
+    db.exec("BEGIN");
+    try {
+      plan();
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
     }
+  } else {
+    plan();
   }
   const crucial = db.prepare(
     "SELECT id, kind, rank, content FROM memories WHERE source != 'seed' AND origin IS NULL AND (kind IN ('decision','gotcha','debt') OR rank IN ('critical','high'))"
@@ -13348,7 +13430,8 @@ function reworkFileIntoDb(db, root, kind, rel) {
       rank: doc.rank,
       source: "seed",
       origin: doc.origin,
-      verified: doc.verified ?? void 0
+      verified: doc.verified ?? void 0,
+      exact: true
     });
     if (res.status === "inserted") report.inserted++;
     else report.updated++;
@@ -13707,7 +13790,7 @@ function makeTools(root, db) {
       const report = reSeedFromDocs(db, root, args.apply ?? false);
       const lines = [
         `${report.apply ? "APPLIED" : "DRY-RUN"} re-seed: files=${report.files} docFacts=${report.docFacts}`,
-        `inserted=${report.inserted} updatedContent=${report.updatedContent} rebound=${report.rebound} demoted=${report.demoted} unchanged=${report.unchanged}`
+        `inserted=${report.inserted} updatedContent=${report.updatedContent} rebound=${report.rebound} demoted=${report.demoted} merged=${report.merged} unchanged=${report.unchanged}`
       ];
       if (report.missingFromDocs.length > 0) {
         lines.push("", `Crucial facts present in memory but missing from docs (${report.missingFromDocs.length}):`);

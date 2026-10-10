@@ -145,7 +145,7 @@ function makeTools(root: string, db: DB): Record<string, ToolDefinition> {
       const report = reSeedFromDocs(db, root, args.apply ?? false)
       const lines = [
         `${report.apply ? "APPLIED" : "DRY-RUN"} re-seed: files=${report.files} docFacts=${report.docFacts}`,
-        `inserted=${report.inserted} updatedContent=${report.updatedContent} rebound=${report.rebound} demoted=${report.demoted} unchanged=${report.unchanged}`,
+        `inserted=${report.inserted} updatedContent=${report.updatedContent} rebound=${report.rebound} demoted=${report.demoted} merged=${report.merged} unchanged=${report.unchanged}`,
       ]
       if (report.missingFromDocs.length > 0) {
         lines.push("", `Crucial facts present in memory but missing from docs (${report.missingFromDocs.length}):`)

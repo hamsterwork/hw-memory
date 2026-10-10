@@ -43,6 +43,7 @@ export interface AddInput {
   source?: Source
   origin?: string
   verified?: string
+  exact?: boolean
 }
 
 export interface AddResult {
@@ -67,6 +68,31 @@ export function promoteRank(rank: Rank, accesses: number): Rank {
   if (rank === "low" && accesses >= 4) return "medium"
   if (rank === "medium" && accesses >= 8) return "high"
   return rank
+}
+
+function normalizeSeedOrigins(db: DB): void {
+  const dups = db
+    .prepare(
+      "SELECT origin FROM memories WHERE source = 'seed' AND origin IS NOT NULL GROUP BY origin HAVING COUNT(*) > 1",
+    )
+    .all() as any[]
+  for (const d of dups) {
+    const rows = db
+      .prepare("SELECT id, rank, accesses FROM memories WHERE source = 'seed' AND origin = ? ORDER BY id ASC")
+      .all(d.origin) as any[]
+    let survivor = rows[0]
+    for (const r of rows) {
+      const better =
+        RANK_ORDER[r.rank as Rank] > RANK_ORDER[survivor.rank as Rank] ||
+        (RANK_ORDER[r.rank as Rank] === RANK_ORDER[survivor.rank as Rank] && r.accesses > survivor.accesses)
+      if (better) survivor = r
+    }
+    const totalAccesses = rows.reduce((sum, r) => sum + (r.accesses as number), 0)
+    db.prepare("UPDATE memories SET accesses = ? WHERE id = ?").run(totalAccesses, survivor.id)
+    for (const r of rows) {
+      if (r.id !== survivor.id) db.prepare("DELETE FROM memories WHERE id = ?").run(r.id)
+    }
+  }
 }
 
 export function initSchema(db: DB): void {
@@ -106,6 +132,11 @@ export function initSchema(db: DB): void {
     );
   `)
   ensureFileTargets(db)
+  normalizeSeedOrigins(db)
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_seed_origin
+       ON memories(origin) WHERE source = 'seed' AND origin IS NOT NULL;`,
+  )
 }
 
 export function effectiveAgeDays(row: Pick<FactRow, "created_at" | "last_verified_at">): number {
@@ -145,10 +176,11 @@ export function countFacts(db: DB): number {
   return (db.prepare("SELECT COUNT(*) AS c FROM memories").get() as any).c as number
 }
 
-export function findSimilar(db: DB, content: string, kind: Kind): FactRow | null {
+export function findSimilar(db: DB, content: string, kind: Kind, exactOnly = false): FactRow | null {
   const hash = contentHash(content)
   const exact = db.prepare("SELECT * FROM memories WHERE content_hash = ?").get(hash)
   if (exact) return rowToFact(exact)
+  if (exactOnly) return null
   const target = tokenSet(content)
   if (target.size === 0) return null
   const rows = db.prepare("SELECT * FROM memories WHERE kind = ?").all(kind) as any[]
@@ -174,7 +206,7 @@ export function addFact(db: DB, input: AddInput): AddResult {
   const content = input.content.trim().replace(/\s+/g, " ")
   const kind = input.kind ?? "fact"
   const requestedRank = kind === "debt" ? clampDebtRank(input.rank) : input.rank
-  const dup = findSimilar(db, content, kind)
+  const dup = findSimilar(db, content, kind, input.exact ?? false)
   const now = nowISO()
   if (dup) {
     const accesses = dup.accesses + 1

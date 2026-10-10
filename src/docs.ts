@@ -3,7 +3,7 @@ import { join } from "node:path"
 import type { DB } from "./db.ts"
 import { isDir, isFile } from "./fs.ts"
 import type { FactRow, Kind, Rank } from "./core.ts"
-import { addFact } from "./core.ts"
+import { addFact, computeWeight, RANK_ORDER } from "./core.ts"
 import {
   DEFAULT_TARGET_PATH,
   getTarget,
@@ -76,6 +76,7 @@ export function parseDocFile(
   let contextDate: string | null = null
   const stem = (rel.split("/").pop() ?? rel).replace(/\.md$/i, "")
   const anchorCounters = new Map<string, number>()
+  const usedAnchors = new Set<string>()
   for (const raw of lines) {
     const trimmed = raw.trim()
     if (/^(```|~~~)/.test(trimmed)) {
@@ -100,12 +101,19 @@ export function parseDocFile(
     let anchor: string
     if (numbered) {
       anchor = numbered[1]
+      if (usedAnchors.has(anchor)) {
+        const base = slugify(section || stem)
+        anchor = `${base}-${numbered[1]}`
+        let k = 1
+        while (usedAnchors.has(anchor)) anchor = `${base}-${numbered[1]}-${++k}`
+      }
     } else {
       const base = slugify(section || stem)
       const n = (anchorCounters.get(base) ?? 0) + 1
       anchorCounters.set(base, n)
       anchor = `${base}-${n}`
     }
+    usedAnchors.add(anchor)
     const keywords = keywordsFrom(content, [stem, ...tokenize(section).slice(0, 3)])
     facts.push({
       content,
@@ -178,6 +186,7 @@ export function seedFromDocs(db: DB, root: string): SeedReport {
         source: "seed",
         origin: doc.origin,
         verified: doc.verified ?? undefined,
+        exact: true,
       })
       if (res.status === "inserted") report.inserted++
       else report.updated++
@@ -195,6 +204,7 @@ export interface ReSeedReport {
   rebound: number
   demoted: number
   unchanged: number
+  merged: number
   missingFromDocs: { id: number; kind: string; rank: string; content: string }[]
 }
 
@@ -205,6 +215,22 @@ function similarity(a: Set<string>, b: Set<string>): number {
   const jac = union === 0 ? 0 : inter / union
   const containment = inter / Math.min(a.size, b.size)
   return Math.max(jac, containment >= 0.9 ? containment : 0)
+}
+
+function mergeDuplicate(db: DB, hash: string, dropId: number): void {
+  const owner = db.prepare("SELECT id, rank, accesses FROM memories WHERE content_hash = ?").get(hash) as any
+  if (!owner || owner.id === dropId) return
+  const drop = db.prepare("SELECT rank, accesses FROM memories WHERE id = ?").get(dropId) as any
+  if (!drop) return
+  const accesses = (owner.accesses as number) + (drop.accesses as number)
+  const rank = (RANK_ORDER[drop.rank as Rank] > RANK_ORDER[owner.rank as Rank] ? drop.rank : owner.rank) as Rank
+  db.prepare("UPDATE memories SET accesses = ?, rank = ?, weight = ? WHERE id = ?").run(
+    accesses,
+    rank,
+    computeWeight(rank, accesses, 0),
+    owner.id,
+  )
+  db.prepare("DELETE FROM memories WHERE id = ?").run(dropId)
 }
 
 export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedReport {
@@ -220,6 +246,7 @@ export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedRepor
     rebound: 0,
     demoted: 0,
     unchanged: 0,
+    merged: 0,
     missingFromDocs: [],
   }
   const docByHash = new Map<string, DocFact>()
@@ -227,73 +254,112 @@ export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedRepor
   const docByOrigin = new Map<string, DocFact>()
   for (const d of docFacts) if (!docByOrigin.has(d.origin)) docByOrigin.set(d.origin, d)
   const matched = new Set<string>()
-  const usedOrigins = new Set<string>()
+  const claimedOrigins = new Set<string>()
   const seedRows = db.prepare("SELECT * FROM memories WHERE source = 'seed'").all() as any[]
-  for (const r of seedRows) {
-    const row = r as unknown as FactRow
-    const byHash = docByHash.get(row.content_hash)
-    if (byHash) {
+
+  const plan = () => {
+    // Pass 1: rows whose exact content is a current doc fact claim that fact first,
+    // so a lower-id row can never steal a content_hash still held by another row.
+    const pending: FactRow[] = []
+    for (const r of seedRows) {
+      const row = r as unknown as FactRow
+      const byHash = docByHash.get(row.content_hash)
+      if (!byHash) {
+        pending.push(row)
+        continue
+      }
       matched.add(byHash.hash)
-      usedOrigins.add(byHash.origin)
+      claimedOrigins.add(byHash.origin)
       if (byHash.origin !== row.origin) {
         report.rebound++
-        if (apply) db.prepare("UPDATE memories SET origin = ?, last_verified_at = ? WHERE id = ?").run(byHash.origin, todayISO(), row.id)
+        if (apply) {
+          db.prepare("UPDATE memories SET origin = ?, last_verified_at = ? WHERE id = ?").run(byHash.origin, todayISO(), row.id)
+        }
       } else {
         report.unchanged++
       }
-      continue
     }
-    const byOrigin = usedOrigins.has(row.origin ?? "") ? undefined : docByOrigin.get(row.origin ?? "")
-    if (byOrigin) {
-      matched.add(byOrigin.hash)
-      usedOrigins.add(byOrigin.origin)
-      report.updatedContent++
-      if (apply) {
-        db.prepare(
-          "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, last_verified_at = ? WHERE id = ?",
-        ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.verified ?? todayISO(), row.id)
+    // Pass 2: content edited at the same origin, moved by similarity, duplicate, or vanished.
+    for (const row of pending) {
+      const byOrigin = docByOrigin.get(row.origin ?? "")
+      if (byOrigin) {
+        if (matched.has(byOrigin.hash)) {
+          report.merged++
+          if (apply) mergeDuplicate(db, byOrigin.hash, row.id)
+          continue
+        }
+        matched.add(byOrigin.hash)
+        claimedOrigins.add(byOrigin.origin)
+        report.updatedContent++
+        if (apply) {
+          db.prepare(
+            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, last_verified_at = ? WHERE id = ?",
+          ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.verified ?? todayISO(), row.id)
+        }
+        continue
       }
-      continue
+      const rowTokens = new Set(tokenize(row.content))
+      let best: DocFact | null = null
+      let bestScore = 0
+      for (const d of docFacts) {
+        if (matched.has(d.hash) || d.kind !== row.kind || claimedOrigins.has(d.origin)) continue
+        const score = similarity(rowTokens, new Set(tokenize(d.content)))
+        if (score > bestScore) {
+          bestScore = score
+          best = d
+        }
+      }
+      if (best && bestScore >= 0.75) {
+        matched.add(best.hash)
+        claimedOrigins.add(best.origin)
+        report.rebound++
+        if (apply) {
+          db.prepare(
+            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, origin = ?, last_verified_at = ? WHERE id = ?",
+          ).run(best.content, best.hash, best.keywords.join(","), best.origin, best.verified ?? todayISO(), row.id)
+        }
+        continue
+      }
+      if (row.rank === "low") {
+        report.unchanged++
+      } else {
+        report.demoted++
+        if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6 WHERE id = ?").run(row.id)
+      }
     }
-    const rowTokens = new Set(tokenize(row.content))
-    let best: DocFact | null = null
-    let bestScore = 0
+    // Insertion: one row per unmatched unique doc fact, identified by exact content hash only.
     for (const d of docFacts) {
-      if (matched.has(d.hash) || d.kind !== row.kind) continue
-      const score = similarity(rowTokens, new Set(tokenize(d.content)))
-      if (score > bestScore) {
-        bestScore = score
-        best = d
-      }
-    }
-    if (best && bestScore >= 0.75) {
-      matched.add(best.hash)
-      report.rebound++
+      if (matched.has(d.hash)) continue
+      matched.add(d.hash)
+      if (db.prepare("SELECT 1 FROM memories WHERE content_hash = ?").get(d.hash)) continue
+      if (db.prepare("SELECT 1 FROM memories WHERE source = 'seed' AND origin = ?").get(d.origin)) continue
+      report.inserted++
       if (apply) {
-        db.prepare(
-          "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, origin = ?, last_verified_at = ? WHERE id = ?",
-        ).run(best.content, best.hash, best.keywords.join(","), best.origin, best.verified ?? todayISO(), row.id)
+        addFact(db, {
+          content: d.content,
+          keywords: d.keywords,
+          kind: d.kind,
+          rank: d.rank,
+          source: "seed",
+          origin: d.origin,
+          verified: d.verified ?? undefined,
+          exact: true,
+        })
       }
-      continue
     }
-    report.demoted++
-    if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6 WHERE id = ?").run(row.id)
   }
-  for (const d of docFacts) {
-    if (matched.has(d.hash)) continue
-    if (db.prepare("SELECT 1 FROM memories WHERE content_hash = ?").get(d.hash)) continue
-    report.inserted++
-    if (apply) {
-      addFact(db, {
-        content: d.content,
-        keywords: d.keywords,
-        kind: d.kind,
-        rank: d.rank,
-        source: "seed",
-        origin: d.origin,
-        verified: d.verified ?? undefined,
-      })
+
+  if (apply) {
+    db.exec("BEGIN")
+    try {
+      plan()
+      db.exec("COMMIT")
+    } catch (e) {
+      db.exec("ROLLBACK")
+      throw e
     }
+  } else {
+    plan()
   }
   const crucial = db
     .prepare(
@@ -444,6 +510,7 @@ export function reworkFileIntoDb(db: DB, root: string, kind: ManagedKind, rel: s
       source: "seed",
       origin: doc.origin,
       verified: doc.verified ?? undefined,
+      exact: true,
     })
     if (res.status === "inserted") report.inserted++
     else report.updated++

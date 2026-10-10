@@ -351,3 +351,130 @@ test("file targets are disabled by default and settable", () => {
   assert.deepEqual(updated, { kind: "debt", enabled: true, path: "docs/hw-memory/debt.md" })
   setTarget(db, "debt", { enabled: false })
 })
+
+function makeTempProject(files: Record<string, string>): string {
+  const root = mkdtempSync(join(tmpdir(), "hwm-reseed-"))
+  for (const [rel, text] of Object.entries(files)) {
+    const abs = join(root, rel)
+    mkdirSync(join(abs, ".."), { recursive: true })
+    writeFileSync(abs, text)
+  }
+  return root
+}
+
+function rowCount(database: DB): number {
+  return (database.prepare("SELECT COUNT(*) AS c FROM memories").get() as any).c as number
+}
+
+test("reSeed apply is a fixed point and never absorbs near-duplicates", async () => {
+  const root = makeTempProject({
+    "AGENTS.md": "# Agents\n\n- Always run the full parser suite before committing changes to the grammar.\n",
+    "docs/context.md": "# Context\n\n## Parser\n\n- Always run the full parser test suite before committing any grammar changes.\n",
+  })
+  const dbx = await openDBFile(join(root, ".opencode", "hw-memory.db"))
+  initSchema(dbx)
+  const first = reSeedFromDocs(dbx, root, true)
+  assert.equal(first.inserted, 2)
+  assert.equal(rowCount(dbx), 2)
+  const second = reSeedFromDocs(dbx, root, true)
+  assert.equal(second.inserted, 0)
+  assert.equal(second.updatedContent, 0)
+  assert.equal(second.rebound, 0)
+  assert.equal(second.demoted, 0)
+  assert.equal(second.merged, 0)
+  assert.equal(rowCount(dbx), 2)
+  dbx.close()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("reSeed dry-run classifies the same as apply", async () => {
+  const contextRel = "docs/context.md"
+  const original = "# Context\n\n## Build\n\n- The build pipeline compiles the theme modules the client needs.\n- The pipeline writes all output into the dist folder.\n"
+  const root = makeTempProject({ [contextRel]: original })
+  const dbx = await openDBFile(join(root, ".opencode", "hw-memory.db"))
+  initSchema(dbx)
+  reSeedFromDocs(dbx, root, true)
+  writeFileSync(
+    join(root, contextRel),
+    "# Context\n\n## Build\n\n- The build pipeline compiles only the theme modules the client needs.\n\n## Deploy\n\n- Deployment copies the compiled bundle to the staging server.\n",
+  )
+  const dry = reSeedFromDocs(dbx, root, false)
+  const applied = reSeedFromDocs(dbx, root, true)
+  const pick = (r: ReturnType<typeof reSeedFromDocs>) => ({
+    inserted: r.inserted,
+    updatedContent: r.updatedContent,
+    rebound: r.rebound,
+    demoted: r.demoted,
+    merged: r.merged,
+  })
+  assert.deepEqual(pick(dry), pick(applied))
+  assert.equal(applied.updatedContent, 1)
+  assert.equal(applied.demoted, 1)
+  assert.equal(applied.inserted, 1)
+  const again = reSeedFromDocs(dbx, root, true)
+  assert.equal(again.inserted, 0)
+  assert.equal(again.updatedContent, 0)
+  assert.equal(again.rebound, 0)
+  assert.equal(again.demoted, 0)
+  assert.equal(again.merged, 0)
+  dbx.close()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("reSeed does not throw on legacy duplicate origins and restores uniqueness", async () => {
+  const origin = "docs/roles/manager.md#runs-1"
+  const docText = "# Manager\n\n## Runs\n\n- Run the complete suite with SITE=<id> npm test for every release.\n"
+  const root = makeTempProject({ "docs/roles/manager.md": docText })
+  const dbx = await openDBFile(join(root, ".opencode", "hw-memory.db"))
+  initSchema(dbx)
+  dbx.exec("DROP INDEX IF EXISTS ux_memories_seed_origin")
+  const doc = parseDocFile(join(root, "docs/roles/manager.md"), "docs/roles/manager.md")[0]
+  assert.equal(doc.origin, origin)
+  addFact(dbx, { content: doc.content, kind: doc.kind, rank: doc.rank, source: "seed", origin, exact: true })
+  addFact(dbx, {
+    content: "A totally unrelated legacy note about widgets and gadgets.",
+    kind: "fact",
+    rank: "low",
+    source: "seed",
+    origin,
+    exact: true,
+  })
+  assert.equal(rowCount(dbx), 2)
+  const report = reSeedFromDocs(dbx, root, true)
+  assert.ok(report.merged >= 1)
+  const dupes = dbx
+    .prepare("SELECT origin FROM memories WHERE source = 'seed' AND origin IS NOT NULL GROUP BY origin HAVING COUNT(*) > 1")
+    .all()
+  assert.equal(dupes.length, 0)
+  assert.equal(rowCount(dbx), 1)
+  dbx.close()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("initSchema normalizes legacy duplicate seed origins and enforces the unique index", async () => {
+  const origin = "docs/legacy.md#section-1"
+  const root = mkdtempSync(join(tmpdir(), "hwm-norm-"))
+  const dbx = await openDBFile(join(root, "hw-memory.db"))
+  initSchema(dbx)
+  dbx.exec("DROP INDEX IF EXISTS ux_memories_seed_origin")
+  const insert = (content: string, hash: string, rank: string, accesses: number) =>
+    dbx
+      .prepare(
+        `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
+         VALUES (?, ?, '', 'fact', ?, 1.0, ?, 'seed', ?, NULL, '2026-01-01T00:00:00.000Z', NULL)`,
+      )
+      .run(content, hash, rank, accesses, origin)
+  insert("legacy duplicate alpha", "h-alpha", "medium", 1)
+  insert("legacy duplicate beta", "h-beta", "high", 3)
+  initSchema(dbx)
+  const rows = dbx.prepare("SELECT rank, accesses FROM memories WHERE origin = ?").all(origin) as any[]
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].rank, "high")
+  assert.equal(rows[0].accesses, 4)
+  assert.throws(() =>
+    insert("another duplicate", "h-gamma", "medium", 0),
+  )
+  dbx.close()
+  rmSync(root, { recursive: true, force: true })
+})
+
