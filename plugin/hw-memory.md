@@ -15,22 +15,20 @@ You have permanent project memory via hw-memory tools. The project's `docs/` mar
 - **Before finishing a task you MUST tell the user about every debt item you recorded in that task.** Use `hw_memory_debt` (`action: list`) to recall the open items.
 - Use `hw_memory_debt` (`action: list`) to review open debt when the user asks about known issues.
 
-## Managed files (hw_memory_config / hw_memory_file)
+## Managed files (hw_memory_config)
 
 - `decision`, `gotcha` and `debt` facts live in the DB. Each entity can *optionally* also be written to a markdown file.
-- Fresh installs have all three **disabled** (DB only). Enable and aim them with `hw_memory_config` (`entity`, `enabled`, `path`); defaults are `docs/hw-memory/decisions.md`, `gotchas.md`, `debt.md`.
-- `hw_memory_file` attaches a specific file to an entity (`kind`, `file`) and appends any missing facts. `rework: true` first reads that file's existing content into the DB — use it to adopt memoirs that live outside `docs/`.
+- Fresh installs have all three **disabled** (DB only). Enable them with `hw_memory_config` (`entity`, `enabled`); they write to fixed files `docs/hw-memory/decisions.md`, `gotchas.md`, `debt.md`.
 
 ## When to recall (hw_memory_search)
 
 - Before risky or uncertain work, and whenever a past decision, pitfall or constraint might exist.
 - When the user references something "we decided earlier" or "remember the issue with...".
 
-## Re-seed and migrate — direct user command only
+## Re-seed — direct user command only
 
-- `hw_memory_seed` / `hw_memory_migrate`: **never run these on your own initiative.** Only when the user explicitly asks (e.g. "seed memory", "re-seed memory", "migrate .memory"). Default is a dry-run report — show it to the user and apply (`apply: true`) only after they confirm.
+- `hw_memory_seed`: **never run on your own initiative.** Only when the user explicitly asks (e.g. "seed memory", "re-seed memory"). Default is a dry-run report — show it to the user and apply (`apply: true`) only after they confirm.
 - `hw_memory_seed` is also the first-time seed: on a fresh install the memory DB is empty until the user runs it. If memory is empty and the project has docs/, mention to the user that seeding is available.
-- `hw_memory_migrate` also upgrades legacy `docs/decisions.md` / `docs/gotchas.md` to the managed `docs/hw-memory/` layout and enables those entities.
 - Suggest re-seed when the user mentions they edited docs/ markdown manually.
 
 ## Rules

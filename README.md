@@ -88,19 +88,19 @@ while the DB is open loses the writes it still holds.
 - **Wake-up**: injects top-ranked facts into the system prompt every session, with pointers to authoritative docs and an open technical-debt count.
 - **Self-adding**: rule-based extraction from bash tool output (errors, dependencies) and assistant text (decisions). Repeated failures followed by success are promoted to gotchas.
 - **Technical debt (`kind: debt`)**: bugs, mismatches and errors noticed while working on an unrelated task. Ranked `medium`…`critical`, never pruned until explicitly resolved (`hw_memory_debt`). The agent is instructed to report new debt before finishing a task.
-- **Managed files (optional)**: `decision`, `gotcha` and `debt` live in the DB. Each entity can separately write back to markdown — `docs/hw-memory/decisions.md`, `gotchas.md`, `debt.md` by default. Fresh installs are DB-only (all disabled); enable per entity with `hw_memory_config`, or attach/import an existing file with `hw_memory_file` (`rework: true` ingests the file's current content).
+- **Managed files (optional)**: `decision`, `gotcha` and `debt` live in the DB. Each entity can separately write back to markdown — `docs/hw-memory/decisions.md`, `gotchas.md`, `debt.md` by default. Fresh installs are DB-only (all disabled); enable per entity with `hw_memory_config`.
 - **Ranks and decay**: critical (never fades), high (slow, never pruned), medium (default), low (fast, pruned below weight 0.2). Debt is exempt from pruning/capping. Access-aware: frequently recalled facts decay slower.
 - **Compaction-safe**: facts are re-injected as compaction context so nothing is lost at context boundaries.
 
 ## Tools
 
-`hw_memory_add`, `hw_memory_search`, `hw_memory_stats`, `hw_memory_forget`, `hw_memory_debt` (list/resolve technical debt), `hw_memory_config` (per-entity managed-file enable/path), `hw_memory_file` (attach/sync/rework a markdown file for an entity), `hw_memory_seed` (re-sync from docs, dry-run default, explicit user command only), `hw_memory_migrate` (convert legacy `.memory/` and upgrade legacy `docs/decisions.md`/`docs/gotchas.md` into `docs/hw-memory/`, never deletes anything).
+`hw_memory_add`, `hw_memory_search`, `hw_memory_stats`, `hw_memory_forget`, `hw_memory_debt` (list/resolve technical debt), `hw_memory_config` (per-entity managed-file write-back on/off), `hw_memory_seed` (re-sync from docs, dry-run default, explicit user command only).
 
 ## Development
 
 ```sh
 npm install
-npm test              # node --test, 67 tests
+npm test              # node --test, 59 tests
 npm run test:install  # installer tests: project/global, AGENTS.md/CLAUDE.md, SHA256
 npm run test:update   # updater tests: version detection, --check, verified update
 npm run build         # bundles src/hw-memory.ts -> plugin/hw-memory.ts (single file, zod inlined, version banner)
@@ -111,4 +111,4 @@ Runtime: the plugin runs inside opencode's Bun (`bun:sqlite`); tests run on Node
 
 ## Safety
 
-The tool never deletes memories of rank critical/high, never deletes files, and never runs `hw_memory_seed`/`hw_memory_migrate` without an explicit user command. Manual edits to docs are not tracked; run `hw_memory_seed` to compare and re-sync.
+The tool never deletes memories of rank critical/high, never deletes files, and never runs `hw_memory_seed` without an explicit user command. Manual edits to docs are not tracked; run `hw_memory_seed` to compare and re-sync.

@@ -32,7 +32,7 @@ export function managedRank(kind: ManagedKind): Rank {
 
 export function rankForPath(rel: string): { kind: Kind; rank: Rank } | null {
   const p = rel.replaceAll("\\", "/").toLowerCase()
-  if (p.startsWith(".memory/") || p.startsWith(".opencode/") || p.startsWith("node_modules/")) return null
+  if (p.startsWith(".opencode/") || p.startsWith("node_modules/")) return null
   const base = p.split("/").pop() ?? p
   if (base === "decisions.md") return { kind: "decision", rank: "critical" }
   if (base === "gotchas.md") return { kind: "gotcha", rank: "high" }
@@ -487,35 +487,6 @@ export function syncEntityToFile(db: DB, root: string, kind: ManagedKind): SyncR
     }
   }
   return { file: rel, written, origin }
-}
-
-export interface ReworkResult {
-  facts: number
-  inserted: number
-  updated: number
-}
-
-export function reworkFileIntoDb(db: DB, root: string, kind: ManagedKind, rel: string): ReworkResult {
-  const abs = join(root, rel)
-  const report: ReworkResult = { facts: 0, inserted: 0, updated: 0 }
-  if (!isFile(abs)) return report
-  const rank = managedRank(kind)
-  for (const doc of parseDocFile(abs, rel, { kind, rank })) {
-    report.facts++
-    const res = addFact(db, {
-      content: doc.content,
-      keywords: doc.keywords,
-      kind: doc.kind,
-      rank: doc.rank,
-      source: "seed",
-      origin: doc.origin,
-      verified: doc.verified ?? undefined,
-      exact: true,
-    })
-    if (res.status === "inserted") report.inserted++
-    else report.updated++
-  }
-  return report
 }
 
 export function removeEntityLine(root: string, rel: string, content: string): boolean {

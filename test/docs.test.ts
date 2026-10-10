@@ -15,7 +15,6 @@ import {
   rankForPath,
   removeEntityLine,
   reSeedFromDocs,
-  reworkFileIntoDb,
   seedFromDocs,
   syncEntityToFile,
   writeEntity,
@@ -134,7 +133,6 @@ test("rankForPath mapping", () => {
   assert.deepEqual(rankForPath("docs/Changelog.md"), { kind: "changelog", rank: "low" })
   assert.deepEqual(rankForPath("AGENTS.md"), { kind: "fact", rank: "medium" })
   assert.deepEqual(rankForPath("README.md"), { kind: "fact", rank: "medium" })
-  assert.equal(rankForPath(".memory/ai/gotchas.md"), null)
   assert.equal(rankForPath(".opencode/rule/hw-memory.md"), null)
   assert.equal(rankForPath("node_modules/foo/docs/x.md"), null)
   assert.equal(rankForPath("random/notes.md"), null)
@@ -315,23 +313,23 @@ test("syncEntityToFile appends missing facts and is idempotent", async () => {
   rmSync(fresh, { recursive: true, force: true })
 })
 
-test("reworkFileIntoDb ingests an existing file and removeEntityLine prunes it", async () => {
-  const fresh = mkdtempSync(join(tmpdir(), "hwm-rework-"))
+test("removeEntityLine prunes a synced managed file line", async () => {
+  const fresh = mkdtempSync(join(tmpdir(), "hwm-remove-"))
   const freshDb = await openDBFile(join(fresh, ".opencode", "hw-memory.db"))
   initSchema(freshDb)
-  const rel = "notes/legacy-debt.md"
-  mkdirSync(join(fresh, "notes"), { recursive: true })
-  writeFileSync(
-    join(fresh, rel),
-    "# Debt\n\n- **Legacy issue**: The old importer cannot handle multi-byte separator tokens.\n",
-  )
-  const r = reworkFileIntoDb(freshDb, fresh, "debt", rel)
-  assert.equal(r.facts, 1)
-  assert.equal(r.inserted, 1)
+  setTarget(freshDb, "debt", { enabled: true })
+  addFact(freshDb, {
+    content: "The old importer cannot handle multi-byte separator tokens",
+    kind: "debt",
+    rank: "high",
+    source: "agent",
+  })
+  const sync = syncEntityToFile(freshDb, fresh, "debt")
+  assert.equal(sync.written, 1)
   const rows = searchFacts(freshDb, "multi-byte separator tokens", { kinds: ["debt"] })
   assert.equal(rows.length, 1)
-  assert.equal(removeEntityLine(fresh, rel, rows[0].content), true)
-  assert.ok(!readFileSync(join(fresh, rel), "utf8").includes("multi-byte separator"))
+  assert.equal(removeEntityLine(fresh, sync.file, rows[0].content), true)
+  assert.ok(!readFileSync(join(fresh, sync.file), "utf8").includes("multi-byte separator"))
   freshDb.close()
   rmSync(fresh, { recursive: true, force: true })
 })

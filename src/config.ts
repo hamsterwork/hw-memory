@@ -22,12 +22,6 @@ export function isManagedKind(kind: string): kind is ManagedKind {
   return (MANAGED_KINDS as string[]).includes(kind)
 }
 
-export function isSafeRelPath(path: string): boolean {
-  if (!path || path.startsWith("/") || path.startsWith("\\")) return false
-  if (/^[A-Za-z]:[\\/]/.test(path)) return false
-  return !path.replaceAll("\\", "/").split("/").includes("..")
-}
-
 export function ensureFileTargets(db: DB): void {
   for (const kind of MANAGED_KINDS) {
     db.prepare("INSERT OR IGNORE INTO file_targets (kind, enabled, path) VALUES (?, 0, ?)").run(

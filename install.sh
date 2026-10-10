@@ -252,10 +252,5 @@ log "  plugin: $plugin_dir/hw-memory.ts"
 if [ "$rules_written" = 1 ]; then
   log "  rules:  $rules_file"
 fi
-if [ "$GLOBAL" = 0 ] && [ -d "$target/.memory" ]; then
-  log ""
-  log "Legacy .memory/ detected. After restarting opencode, ask the agent:"
-  log "  'run hw_memory_migrate' (dry-run first, then apply)"
-fi
 log ""
 log "Restart opencode to activate."

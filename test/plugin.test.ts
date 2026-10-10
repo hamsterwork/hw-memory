@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { HwMemoryPlugin } from "../src/hw-memory.ts"
@@ -19,10 +19,8 @@ const TOOL_NAMES = [
   "hw_memory_stats",
   "hw_memory_forget",
   "hw_memory_seed",
-  "hw_memory_migrate",
   "hw_memory_debt",
   "hw_memory_config",
-  "hw_memory_file",
 ]
 
 test("plugin registers all tools", async () => {
@@ -73,25 +71,5 @@ test("disabled managed files keep facts DB-only", async () => {
     rank: "high",
   })
   assert.ok(!existsSync(join(root, "docs", "hw-memory", "gotchas.md")))
-  rmSync(root, { recursive: true, force: true })
-})
-
-test("rejects unsafe target paths", async () => {
-  const { root, tools } = await setup()
-  assert.match(await tools.hw_memory_config.execute({ entity: "debt", path: "../evil.md" }), /Invalid path/)
-  assert.match(await tools.hw_memory_file.execute({ kind: "debt", file: "/etc/passwd" }), /Invalid file/)
-  rmSync(root, { recursive: true, force: true })
-})
-
-test("hw_memory_file attaches and reworks an external memoir", async () => {
-  const { root, tools } = await setup()
-  const rel = "notes/legacy.md"
-  mkdirSync(join(root, "notes"), { recursive: true })
-  writeFileSync(join(root, rel), "# Legacy debt\n\n- **Old bug**: retry loop never increments the attempt counter.\n")
-  const out = await tools.hw_memory_file.execute({ kind: "debt", file: rel, rework: true })
-  assert.match(out, /Reworked/)
-  const list = await tools.hw_memory_debt.execute({ action: "list" })
-  assert.match(list, /attempt counter/)
-  assert.ok(existsSync(join(root, rel)))
   rmSync(root, { recursive: true, force: true })
 })

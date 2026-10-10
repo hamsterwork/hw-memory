@@ -62,13 +62,6 @@ console.log("--- debt list:", debtList)
 const debtId = Number(debtList.match(/#(\d+)/)[1])
 console.log("--- debt resolve:", await tools.hw_memory_debt.execute({ action: "resolve", id: debtId }))
 
-mkdirSync(join(root, "notes"), { recursive: true })
-writeFileSync(join(root, "notes", "legacy.md"), "# Legacy\n\n- **Old bug**: retry loop never increments the attempt counter.\n")
-console.log(
-  "--- hw_memory_file rework:",
-  await tools.hw_memory_file.execute({ kind: "debt", file: "notes/legacy.md", rework: true }),
-)
-
 const stats = await tools.hw_memory_stats.execute({})
 console.log("--- hw_memory_stats:", stats.split("\n").slice(0, 6).join(" | "))
 

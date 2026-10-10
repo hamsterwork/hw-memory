@@ -4,7 +4,6 @@ import { join } from "node:path"
 import { openDBFile } from "../src/db.ts"
 import { initSchema, searchFacts, statsFacts, wakeUpPack } from "../src/core.ts"
 import { docsFooterLines, seedFromDocs } from "../src/docs.ts"
-import { migrateMemoryDir } from "../src/migrate.ts"
 
 const repos = [
   "/Users/hamsterwork/Dev/wp-wifly-modular",
@@ -25,14 +24,5 @@ for (const repo of repos) {
     const hits = searchFacts(db, query, { limit: 3 })
     console.log(`search "${query}":`, hits.map((h) => `[${h.rank}/${h.kind}] ${h.content.slice(0, 90)}`))
   }
-  db.close()
-}
-
-console.log("\n=== visitator-core .memory migration dry-run ===")
-{
-  const db = await openDBFile(join(mkdtempSync(join(tmpdir(), "hwm-val-")), "hw-memory.db"))
-  initSchema(db)
-  const report = migrateMemoryDir(db, repos[1], false)
-  console.log(JSON.stringify(report, null, 1))
   db.close()
 }
