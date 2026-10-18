@@ -174,6 +174,70 @@ test("parseDocFile extracts facts, skips fences, tables, short nav bullets", () 
   assert.equal(second.verified, "2026-09-18")
 })
 
+const ANCHOR_COLLISION_MD = `# Readme
+
+## Alpha
+
+1. The first alpha rule applies to every build target in the repository.
+
+## Beta Section
+
+1. The beta rule is the first numbered item written in the beta section.
+- A beta bullet that must not collide with the numbered beta item above.
+`
+
+test("parseDocFile keeps anchors unique when a numbered fallback meets a bullet", () => {
+  const root = makeTempProject({ "README.md": ANCHOR_COLLISION_MD })
+  const facts = parseDocFile(join(root, "README.md"), "README.md")
+  const origins = facts.map((f) => f.origin)
+  assert.equal(origins.length, 3)
+  assert.equal(new Set(origins).size, origins.length)
+  assert.equal(origins.filter((o) => o.endsWith("#beta-section-1")).length, 1)
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("reSeed does not throw when a numbered fallback meets a bullet anchor", async () => {
+  const root = makeTempProject({ "README.md": ANCHOR_COLLISION_MD })
+  const dbx = await openDBFile(join(root, ".opencode", "hw-memory.db"))
+  initSchema(dbx)
+  const first = reSeedFromDocs(dbx, root, true)
+  assert.equal(first.inserted, 3)
+  const dupes = dbx
+    .prepare("SELECT origin FROM memories WHERE source = 'seed' AND origin IS NOT NULL GROUP BY origin HAVING COUNT(*) > 1")
+    .all()
+  assert.equal(dupes.length, 0)
+  const second = reSeedFromDocs(dbx, root, true)
+  assert.equal(second.inserted, 0)
+  assert.equal(rowCount(dbx), 3)
+  dbx.close()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("reSeed rebinds swapped origins without hitting the unique index", async () => {
+  const rel = "docs/context.md"
+  const first = "The parser reads the grammar file and compiles a token table for the lexer."
+  const second = "The lexer scans the source stream and emits tokens for the parser to reduce."
+  const root = makeTempProject({ [rel]: `# Context\n\n## Parser\n\n- ${first}\n- ${second}\n` })
+  const dbx = await openDBFile(join(root, ".opencode", "hw-memory.db"))
+  initSchema(dbx)
+  const o1 = "docs/context.md#parser-1"
+  const o2 = "docs/context.md#parser-2"
+  addFact(dbx, { content: first, kind: "fact", rank: "high", source: "seed", origin: o2, exact: true })
+  addFact(dbx, { content: second, kind: "fact", rank: "high", source: "seed", origin: o1, exact: true })
+  const report = reSeedFromDocs(dbx, root, true)
+  assert.equal(report.rebound, 2)
+  assert.equal(rowCount(dbx), 2)
+  const origins = (dbx.prepare("SELECT origin FROM memories WHERE source = 'seed' ORDER BY origin").all() as any[]).map(
+    (r) => r.origin,
+  )
+  assert.deepEqual(origins, [o1, o2])
+  const again = reSeedFromDocs(dbx, root, true)
+  assert.equal(again.rebound, 0)
+  assert.equal(again.inserted, 0)
+  dbx.close()
+  rmSync(root, { recursive: true, force: true })
+})
+
 test("discoverDocFiles finds known layout", () => {
   const files = discoverDocFiles(dir)
   const rels = files.map((f) => f.rel)
