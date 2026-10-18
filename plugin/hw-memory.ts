@@ -1,4 +1,4 @@
-// hw-memory v0.3.0
+// hw-memory v0.3.1
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -13096,9 +13096,10 @@ function parseDocFile(absPath, rel, override) {
       }
     } else {
       const base = slugify(section || stem);
-      const n = (anchorCounters.get(base) ?? 0) + 1;
-      anchorCounters.set(base, n);
+      let n = (anchorCounters.get(base) ?? 0) + 1;
       anchor = `${base}-${n}`;
+      while (usedAnchors.has(anchor)) anchor = `${base}-${++n}`;
+      anchorCounters.set(base, n);
     }
     usedAnchors.add(anchor);
     const keywords = keywordsFrom(content, [stem, ...tokenize(section).slice(0, 3)]);
@@ -13208,6 +13209,7 @@ function reSeedFromDocs(db, root, apply = false) {
         }
       } else {
         report.unchanged++;
+        if (apply) db.prepare("UPDATE memories SET origin = ? WHERE id = ?").run(byHash.origin, row.id);
       }
     }
     for (const row of pending) {
@@ -13223,8 +13225,8 @@ function reSeedFromDocs(db, root, apply = false) {
         report.updatedContent++;
         if (apply) {
           db.prepare(
-            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, last_verified_at = ? WHERE id = ?"
-          ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.verified ?? todayISO(), row.id);
+            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, origin = ?, last_verified_at = ? WHERE id = ?"
+          ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.origin, byOrigin.verified ?? todayISO(), row.id);
         }
         continue;
       }
@@ -13252,9 +13254,10 @@ function reSeedFromDocs(db, root, apply = false) {
       }
       if (row.rank === "low") {
         report.unchanged++;
+        if (apply) db.prepare("UPDATE memories SET origin = ? WHERE id = ?").run(row.origin, row.id);
       } else {
         report.demoted++;
-        if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6 WHERE id = ?").run(row.id);
+        if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6, origin = ? WHERE id = ?").run(row.origin, row.id);
       }
     }
     for (const d of docFacts) {
@@ -13280,6 +13283,7 @@ function reSeedFromDocs(db, root, apply = false) {
   if (apply) {
     db.exec("BEGIN");
     try {
+      db.exec("UPDATE memories SET origin = NULL WHERE source = 'seed'");
       plan();
       db.exec("COMMIT");
     } catch (e) {
