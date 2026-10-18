@@ -109,9 +109,10 @@ export function parseDocFile(
       }
     } else {
       const base = slugify(section || stem)
-      const n = (anchorCounters.get(base) ?? 0) + 1
-      anchorCounters.set(base, n)
+      let n = (anchorCounters.get(base) ?? 0) + 1
       anchor = `${base}-${n}`
+      while (usedAnchors.has(anchor)) anchor = `${base}-${++n}`
+      anchorCounters.set(base, n)
     }
     usedAnchors.add(anchor)
     const keywords = keywordsFrom(content, [stem, ...tokenize(section).slice(0, 3)])
@@ -277,6 +278,7 @@ export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedRepor
         }
       } else {
         report.unchanged++
+        if (apply) db.prepare("UPDATE memories SET origin = ? WHERE id = ?").run(byHash.origin, row.id)
       }
     }
     // Pass 2: content edited at the same origin, moved by similarity, duplicate, or vanished.
@@ -293,8 +295,8 @@ export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedRepor
         report.updatedContent++
         if (apply) {
           db.prepare(
-            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, last_verified_at = ? WHERE id = ?",
-          ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.verified ?? todayISO(), row.id)
+            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, origin = ?, last_verified_at = ? WHERE id = ?",
+          ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.origin, byOrigin.verified ?? todayISO(), row.id)
         }
         continue
       }
@@ -322,9 +324,10 @@ export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedRepor
       }
       if (row.rank === "low") {
         report.unchanged++
+        if (apply) db.prepare("UPDATE memories SET origin = ? WHERE id = ?").run(row.origin, row.id)
       } else {
         report.demoted++
-        if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6 WHERE id = ?").run(row.id)
+        if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6, origin = ? WHERE id = ?").run(row.origin, row.id)
       }
     }
     // Insertion: one row per unmatched unique doc fact, identified by exact content hash only.
@@ -352,6 +355,11 @@ export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedRepor
   if (apply) {
     db.exec("BEGIN")
     try {
+      // Clear seed origins first: reassigning them in place can violate the
+      // partial unique index when one row's new origin is still held by another
+      // row that is itself being rebound. Every seed row gets its final origin
+      // back inside plan().
+      db.exec("UPDATE memories SET origin = NULL WHERE source = 'seed'")
       plan()
       db.exec("COMMIT")
     } catch (e) {
