@@ -2,6 +2,11 @@
 
 Permanent memory for opencode agents. Single-file bundle with no runtime dependencies (zod is inlined), per-project SQLite database.
 
+Targets the OpenCode V2 plugin API (desktop 2.1.x): the module default-exports a
+plain `{ id, setup }` definition, registers tools through `ctx.tool.transform`,
+and hooks `context` / `compaction` / `execute.after` plus the event stream. The DB
+stays per location, at `<location>/.opencode/hw-memory.db`.
+
 `docs/` markdown is the source of truth (human-first). hw-memory seeds a ranked, decaying index from it on first run, optionally writes managed facts back into it (per-entity, off by default), and collects episodic facts from sessions.
 
 ## Install
@@ -100,7 +105,7 @@ while the DB is open loses the writes it still holds.
 
 ```sh
 npm install
-npm test              # node --test, 59 tests
+npm test              # node --test, 69 tests
 npm run test:install  # installer tests: project/global, AGENTS.md/CLAUDE.md, SHA256
 npm run test:update   # updater tests: version detection, --check, verified update
 npm run build         # bundles src/hw-memory.ts -> plugin/hw-memory.ts (single file, zod inlined, version banner)
