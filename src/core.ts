@@ -1,6 +1,6 @@
 import type { DB } from "./db.ts"
 import { ensureFileTargets } from "./config.ts"
-import { contentHash, daysSince, ftsQuery, nowISO, tokenize, tokenSet } from "./util.ts"
+import { contentHash, daysSince, ftsQuery, nowISO, similarityScore, tokenSet } from "./util.ts"
 
 export type Rank = "critical" | "high" | "medium" | "low"
 export type Kind = "decision" | "gotcha" | "debt" | "error" | "dependency" | "fact" | "changelog"
@@ -187,13 +187,7 @@ export function findSimilar(db: DB, content: string, kind: Kind, exactOnly = fal
   let best: FactRow | null = null
   let bestScore = 0
   for (const r of rows) {
-    const other = new Set(tokenize(r.content))
-    let inter = 0
-    for (const t of target) if (other.has(t)) inter++
-    const union = target.size + other.size - inter
-    const jac = union === 0 ? 0 : inter / union
-    const containment = inter / Math.min(target.size, other.size)
-    const score = Math.max(jac, containment >= 0.9 ? containment : 0)
+    const score = similarityScore(target, tokenSet(r.content))
     if (score > bestScore) {
       bestScore = score
       best = rowToFact(r)
@@ -208,7 +202,13 @@ export function addFact(db: DB, input: AddInput): AddResult {
   const requestedRank = kind === "debt" ? clampDebtRank(input.rank) : input.rank
   const dup = findSimilar(db, content, kind, input.exact ?? false)
   const now = nowISO()
-  if (dup) {
+  // Hardening: a tiny stored fragment can never be a superset of a real fact —
+  // if the matched row has < 8 tokens and the new content is materially longer,
+  // store the new fact instead of absorbing it. Defence in depth behind the
+  // comparability gate in similarityScore; see drafts/2026-10-28-dedup-false-positive-short-facts.md.
+  const dupTokens = dup ? tokenSet(dup.content).size : 0
+  const fragmentGuard = dupTokens > 0 && dupTokens < 8 && tokenSet(content).size >= 2 * dupTokens
+  if (dup && !fragmentGuard) {
     const accesses = dup.accesses + 1
     let rank = dup.rank
     if (requestedRank && RANK_ORDER[requestedRank] > RANK_ORDER[rank]) rank = requestedRank

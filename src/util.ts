@@ -40,6 +40,24 @@ export function jaccard(a: Set<string>, b: Set<string>): number {
   return union === 0 ? 0 : inter / union
 }
 
+// Near-duplicate score: jaccard, plus containment of the smaller token set —
+// but only when the two sets are comparable in size (ratio >= 0.6) and already
+// overlap substantially (jaccard >= 0.5). Without those gates a tiny stored
+// fragment swallows any long fact that happens to contain its tokens
+// (drafts/2026-10-28-dedup-false-positive-short-facts.md).
+export function similarityScore(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0
+  let inter = 0
+  for (const t of a) if (b.has(t)) inter++
+  const union = a.size + b.size - inter
+  const jac = union === 0 ? 0 : inter / union
+  const minSize = Math.min(a.size, b.size)
+  const ratio = minSize / Math.max(a.size, b.size)
+  const containment = inter / minSize
+  const containmentUsable = containment >= 0.9 && ratio >= 0.6 && jac >= 0.5
+  return Math.max(jac, containmentUsable ? containment : 0)
+}
+
 export function keywordsFrom(text: string, extra: string[] = [], max = 6): string[] {
   const seen = new Set<string>()
   const out: string[] = []

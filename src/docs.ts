@@ -12,7 +12,7 @@ import {
   type FileTarget,
   type ManagedKind,
 } from "./config.ts"
-import { contentHash, keywordsFrom, parseVerifiedDate, stripMarkdown, titleFrom, tokenize, todayISO } from "./util.ts"
+import { contentHash, keywordsFrom, parseVerifiedDate, similarityScore, stripMarkdown, titleFrom, tokenize, todayISO } from "./util.ts"
 
 export interface DocFact {
   content: string
@@ -77,9 +77,13 @@ export function parseDocFile(
   const stem = (rel.split("/").pop() ?? rel).replace(/\.md$/i, "")
   const anchorCounters = new Map<string, number>()
   const usedAnchors = new Set<string>()
-  for (const raw of lines) {
+  const bulletRe = /^(?:[-*+]|\d+[.)])\s+/
+  const headingRe = /^#{1,6}\s+/
+  const fenceRe = /^(```|~~~)/
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]
     const trimmed = raw.trim()
-    if (/^(```|~~~)/.test(trimmed)) {
+    if (fenceRe.test(trimmed)) {
       inFence = !inFence
       continue
     }
@@ -87,9 +91,9 @@ export function parseDocFile(
     const lineDate = parseVerifiedDate(trimmed)
     if (lineDate) contextDate = lineDate
     if (trimmed.startsWith("|")) continue
-    const heading = trimmed.match(/^#{1,6}\s+(.+)$/)
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/)
     if (heading) {
-      section = stripMarkdown(heading[1])
+      section = stripMarkdown(heading[2])
       continue
     }
     const bullet = trimmed.match(/^(?:[-*+]|\d+[.)])\s+(.+)$/)
@@ -209,15 +213,6 @@ export interface ReSeedReport {
   missingFromDocs: { id: number; kind: string; rank: string; content: string }[]
 }
 
-function similarity(a: Set<string>, b: Set<string>): number {
-  let inter = 0
-  for (const t of a) if (b.has(t)) inter++
-  const union = a.size + b.size - inter
-  const jac = union === 0 ? 0 : inter / union
-  const containment = inter / Math.min(a.size, b.size)
-  return Math.max(jac, containment >= 0.9 ? containment : 0)
-}
-
 function mergeDuplicate(db: DB, hash: string, dropId: number): void {
   const owner = db.prepare("SELECT id, rank, accesses FROM memories WHERE content_hash = ?").get(hash) as any
   if (!owner || owner.id === dropId) return
@@ -305,7 +300,7 @@ export function reSeedFromDocs(db: DB, root: string, apply = false): ReSeedRepor
       let bestScore = 0
       for (const d of docFacts) {
         if (matched.has(d.hash) || d.kind !== row.kind || claimedOrigins.has(d.origin)) continue
-        const score = similarity(rowTokens, new Set(tokenize(d.content)))
+        const score = similarityScore(rowTokens, new Set(tokenize(d.content)))
         if (score > bestScore) {
           bestScore = score
           best = d

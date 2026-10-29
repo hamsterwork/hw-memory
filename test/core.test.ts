@@ -282,3 +282,73 @@ test("stats reports open debt and isCrucial covers debt", () => {
   const stats = statsFacts(db)
   assert.equal(typeof stats.debt, "number")
 })
+
+async function withTempDB(fn: (db: DB) => Promise<void> | void): Promise<void> {
+  const tempDir = mkdtempSync(join(tmpdir(), "hwm-dedup-"))
+  const tdb = await openDBFile(join(tempDir, "hw-memory.db"))
+  initSchema(tdb)
+  try {
+    await fn(tdb)
+  } finally {
+    tdb.close()
+    rmSync(tempDir, { recursive: true, force: true })
+  }
+}
+
+test("short seeded fragment does not swallow a long fact containing its tokens", async () => {
+  await withTempDB(async (tdb) => {
+    addFact(tdb, {
+      content: "schema/client-config.schema.json — the",
+      kind: "fact",
+      rank: "high",
+      source: "seed",
+      origin: "README.md#contracts-5",
+      exact: true,
+    })
+    const res = addFact(tdb, {
+      content:
+        "Client abus joined the client set on 2026-10-28: config/clients/abus.json at schema 1.7 in Fabricator, plus a tracked BUILD-MANIFEST.json in wp-wifly-sites.",
+      kind: "fact",
+      rank: "high",
+    })
+    assert.equal(res.status, "inserted")
+    assert.equal(countFacts(tdb), 2)
+  })
+})
+
+test("three-token fragment does not swallow a same-shape sentence", async () => {
+  await withTempDB(async (tdb) => {
+    addFact(tdb, {
+      content: "Visitator (в visitator-core):",
+      kind: "fact",
+      rank: "high",
+      source: "seed",
+      origin: "docs/manager-readme.md#4",
+      exact: true,
+    })
+    const res = addFact(tdb, {
+      content: "Visitator в visitator-core держит jobs по проверке реального сайта и собирает отчёты.",
+      kind: "fact",
+      rank: "high",
+    })
+    assert.equal(res.status, "inserted")
+    assert.equal(countFacts(tdb), 2)
+  })
+})
+
+test("genuine near-duplicate keeps stored content and bumps accesses", async () => {
+  await withTempDB(async (tdb) => {
+    const first = addFact(tdb, { content: "The parser uses a Pratt algorithm for expressions", kind: "fact", rank: "low" })
+    const second = addFact(tdb, {
+      content: "The parser uses a Pratt algorithm for expressions, with precedence climbing",
+      kind: "fact",
+      rank: "low",
+    })
+    assert.equal(second.status, "updated")
+    assert.equal(second.id, first.id)
+    const fact = getFact(tdb, first.id)
+    assert.ok(fact)
+    assert.equal(fact.content, "The parser uses a Pratt algorithm for expressions")
+    assert.equal(fact.accesses, 1)
+  })
+})
