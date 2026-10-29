@@ -1,4 +1,4 @@
-// hw-memory v0.4.0
+// hw-memory v0.4.1
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -12607,6 +12607,18 @@ function tokenize(text) {
 function tokenSet(text) {
   return new Set(tokenize(text));
 }
+function similarityScore(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  const union2 = a.size + b.size - inter;
+  const jac = union2 === 0 ? 0 : inter / union2;
+  const minSize = Math.min(a.size, b.size);
+  const ratio = minSize / Math.max(a.size, b.size);
+  const containment = inter / minSize;
+  const containmentUsable = containment >= 0.9 && ratio >= 0.6 && jac >= 0.5;
+  return Math.max(jac, containmentUsable ? containment : 0);
+}
 function keywordsFrom(text, extra = [], max = 6) {
   const seen = /* @__PURE__ */ new Set();
   const out = [];
@@ -12782,13 +12794,7 @@ function findSimilar(db, content, kind, exactOnly = false) {
   let best = null;
   let bestScore = 0;
   for (const r of rows) {
-    const other = new Set(tokenize(r.content));
-    let inter = 0;
-    for (const t of target) if (other.has(t)) inter++;
-    const union2 = target.size + other.size - inter;
-    const jac = union2 === 0 ? 0 : inter / union2;
-    const containment = inter / Math.min(target.size, other.size);
-    const score = Math.max(jac, containment >= 0.9 ? containment : 0);
+    const score = similarityScore(target, tokenSet(r.content));
     if (score > bestScore) {
       bestScore = score;
       best = rowToFact(r);
@@ -12802,7 +12808,9 @@ function addFact(db, input) {
   const requestedRank = kind === "debt" ? clampDebtRank(input.rank) : input.rank;
   const dup = findSimilar(db, content, kind, input.exact ?? false);
   const now = nowISO();
-  if (dup) {
+  const dupTokens = dup ? tokenSet(dup.content).size : 0;
+  const fragmentGuard = dupTokens > 0 && dupTokens < 8 && tokenSet(content).size >= 2 * dupTokens;
+  if (dup && !fragmentGuard) {
     const accesses = dup.accesses + 1;
     let rank2 = dup.rank;
     if (requestedRank && RANK_ORDER[requestedRank] > RANK_ORDER[rank2]) rank2 = requestedRank;
@@ -13064,9 +13072,13 @@ function parseDocFile(absPath, rel, override) {
   const stem = (rel.split("/").pop() ?? rel).replace(/\.md$/i, "");
   const anchorCounters = /* @__PURE__ */ new Map();
   const usedAnchors = /* @__PURE__ */ new Set();
-  for (const raw of lines) {
+  const bulletRe = /^(?:[-*+]|\d+[.)])\s+/;
+  const headingRe = /^#{1,6}\s+/;
+  const fenceRe = /^(```|~~~)/;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
     const trimmed = raw.trim();
-    if (/^(```|~~~)/.test(trimmed)) {
+    if (fenceRe.test(trimmed)) {
       inFence = !inFence;
       continue;
     }
@@ -13074,15 +13086,30 @@ function parseDocFile(absPath, rel, override) {
     const lineDate = parseVerifiedDate(trimmed);
     if (lineDate) contextDate = lineDate;
     if (trimmed.startsWith("|")) continue;
-    const heading = trimmed.match(/^#{1,6}\s+(.+)$/);
+    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
     if (heading) {
-      section = stripMarkdown(heading[1]);
+      section = stripMarkdown(heading[2]);
       continue;
     }
     const bullet = trimmed.match(/^(?:[-*+]|\d+[.)])\s+(.+)$/);
     if (!bullet) continue;
+    let text2 = bullet[1];
+    let j = i + 1;
+    while (j < lines.length) {
+      const next = lines[j];
+      const nextTrimmed = next.trim();
+      if (nextTrimmed === "") break;
+      if (!/^\s/.test(next)) break;
+      if (fenceRe.test(nextTrimmed) || bulletRe.test(nextTrimmed) || headingRe.test(nextTrimmed) || nextTrimmed.startsWith("|"))
+        break;
+      const contDate = parseVerifiedDate(nextTrimmed);
+      if (contDate) contextDate = contDate;
+      text2 += ` ${nextTrimmed}`;
+      j++;
+    }
+    i = j - 1;
     const numbered = trimmed.match(/^(\d+)[.)]\s+/);
-    const content = stripMarkdown(bullet[1]).replace(/\s+/g, " ").trim();
+    const content = stripMarkdown(text2).replace(/\s+/g, " ").trim();
     if (content.length < 25) continue;
     const verified = parseVerifiedDate(content) ?? contextDate;
     let anchor;
@@ -13144,14 +13171,6 @@ function discoverDocFiles(root, targets = []) {
     seen.add(t.path);
   }
   return out.sort((a, b) => a.rel.localeCompare(b.rel));
-}
-function similarity(a, b) {
-  let inter = 0;
-  for (const t of a) if (b.has(t)) inter++;
-  const union2 = a.size + b.size - inter;
-  const jac = union2 === 0 ? 0 : inter / union2;
-  const containment = inter / Math.min(a.size, b.size);
-  return Math.max(jac, containment >= 0.9 ? containment : 0);
 }
 function mergeDuplicate(db, hash2, dropId) {
   const owner = db.prepare("SELECT id, rank, accesses FROM memories WHERE content_hash = ?").get(hash2);
@@ -13235,7 +13254,7 @@ function reSeedFromDocs(db, root, apply = false) {
       let bestScore = 0;
       for (const d of docFacts) {
         if (matched.has(d.hash) || d.kind !== row.kind || claimedOrigins.has(d.origin)) continue;
-        const score = similarity(rowTokens, new Set(tokenize(d.content)));
+        const score = similarityScore(rowTokens, new Set(tokenize(d.content)));
         if (score > bestScore) {
           bestScore = score;
           best = d;
