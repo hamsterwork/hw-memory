@@ -196,6 +196,55 @@ test("parseDocFile keeps anchors unique when a numbered fallback meets a bullet"
   rmSync(root, { recursive: true, force: true })
 })
 
+const WRAPPED_BULLETS_MD = `# Readme
+
+## Contracts
+
+- [\`schema/client-config.schema.json\`](schema/client-config.schema.json) — the
+  client config contract.
+
+1. **Fabricator** (в репозитории \`wifly-fabricator\`):
+   \`\`\`bash
+   php bin/init.php
+   \`\`\`
+
+- A short nav item
+`
+
+test("parseDocFile joins wrapped bullet continuations before the length check", () => {
+  const root = makeTempProject({ "README.md": WRAPPED_BULLETS_MD })
+  const facts = parseDocFile(join(root, "README.md"), "README.md")
+  const wrapped = facts.find((f) => f.origin === "README.md#contracts-1")
+  assert.ok(wrapped)
+  assert.equal(wrapped!.content, "schema/client-config.schema.json — the client config contract.")
+  const numbered = facts.find((f) => f.origin === "README.md#1")
+  assert.ok(numbered)
+  assert.ok(!numbered!.content.includes("php bin/init.php"), "fence content must not join the bullet")
+  assert.ok(!facts.some((f) => f.content.includes("A short nav item")))
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("reSeed rewrites a fragment in place once its bullet is joined", async () => {
+  const root = makeTempProject({ "README.md": WRAPPED_BULLETS_MD })
+  const dbx = await openDBFile(join(root, ".opencode", "hw-memory.db"))
+  initSchema(dbx)
+  const fragment = addFact(dbx, {
+    content: "schema/client-config.schema.json — the",
+    kind: "fact",
+    rank: "medium",
+    source: "seed",
+    origin: "README.md#contracts-1",
+    exact: true,
+  })
+  const report = reSeedFromDocs(dbx, root, true)
+  assert.equal(report.updatedContent, 1)
+  const row = getFact(dbx, fragment.id)
+  assert.ok(row)
+  assert.equal(row!.content, "schema/client-config.schema.json — the client config contract.")
+  dbx.close()
+  rmSync(root, { recursive: true, force: true })
+})
+
 test("reSeed does not throw when a numbered fallback meets a bullet anchor", async () => {
   const root = makeTempProject({ "README.md": ANCHOR_COLLISION_MD })
   const dbx = await openDBFile(join(root, ".opencode", "hw-memory.db"))

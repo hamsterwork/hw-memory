@@ -98,8 +98,32 @@ export function parseDocFile(
     }
     const bullet = trimmed.match(/^(?:[-*+]|\d+[.)])\s+(.+)$/)
     if (!bullet) continue
+    // Hard-wrapped docs split a bullet across physical lines: join indented
+    // continuation lines (until a blank line, the next bullet, a heading, a
+    // table row or a fence) before the length check, or every wrapped bullet
+    // seeds as a truncated fragment that swallows new facts in dedup.
+    let text = bullet[1]
+    let j = i + 1
+    while (j < lines.length) {
+      const next = lines[j]
+      const nextTrimmed = next.trim()
+      if (nextTrimmed === "") break
+      if (!/^\s/.test(next)) break
+      if (
+        fenceRe.test(nextTrimmed) ||
+        bulletRe.test(nextTrimmed) ||
+        headingRe.test(nextTrimmed) ||
+        nextTrimmed.startsWith("|")
+      )
+        break
+      const contDate = parseVerifiedDate(nextTrimmed)
+      if (contDate) contextDate = contDate
+      text += ` ${nextTrimmed}`
+      j++
+    }
+    i = j - 1
     const numbered = trimmed.match(/^(\d+)[.)]\s+/)
-    const content = stripMarkdown(bullet[1]).replace(/\s+/g, " ").trim()
+    const content = stripMarkdown(text).replace(/\s+/g, " ").trim()
     if (content.length < 25) continue
     const verified = parseVerifiedDate(content) ?? contextDate
     let anchor: string
