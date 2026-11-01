@@ -48,3 +48,32 @@ export function setTarget(db: DB, kind: ManagedKind, patch: { enabled?: boolean;
 export function listTargets(db: DB): FileTarget[] {
   return MANAGED_KINDS.map((kind) => getTarget(db, kind))
 }
+
+/** Facts kept per project DB when no `cap_rows` setting is stored. */
+export const DEFAULT_CAP_ROWS = 500
+
+export const MIN_CAP_ROWS = 50
+
+export const MAX_CAP_ROWS = 100_000
+
+const CAP_ROWS_KEY = "cap_rows"
+
+/** Effective cap for this project: stored setting inside bounds, else the default. */
+export function getCapRows(db: DB): number {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(CAP_ROWS_KEY) as any
+  const value = row ? Number.parseInt(String(row.value), 10) : Number.NaN
+  if (!Number.isFinite(value) || value < MIN_CAP_ROWS || value > MAX_CAP_ROWS) return DEFAULT_CAP_ROWS
+  return value
+}
+
+/** Store the cap for this project. Throws when out of bounds. */
+export function setCapRows(db: DB, value: number): number {
+  const cap = Math.trunc(value)
+  if (!Number.isFinite(cap) || cap < MIN_CAP_ROWS || cap > MAX_CAP_ROWS) {
+    throw new Error(`cap_rows must be an integer between ${MIN_CAP_ROWS} and ${MAX_CAP_ROWS}`)
+  }
+  db.prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run(CAP_ROWS_KEY, String(cap))
+  return cap
+}

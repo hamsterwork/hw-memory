@@ -1,5 +1,5 @@
 import type { DB } from "./db.ts"
-import { ensureFileTargets } from "./config.ts"
+import { DEFAULT_CAP_ROWS, ensureFileTargets, getCapRows } from "./config.ts"
 import { contentHash, daysSince, ftsQuery, nowISO, similarityScore, tokenSet } from "./util.ts"
 
 export type Rank = "critical" | "high" | "medium" | "low"
@@ -8,7 +8,7 @@ export type Source = "auto" | "agent" | "seed"
 
 export const BASE_RATE = 0.008
 export const PRUNE_WEIGHT = 0.2
-export const CAP_ROWS = 500
+export const CAP_ROWS = DEFAULT_CAP_ROWS
 
 export const RANK_TABLE: Record<Rank, { init: number; rate: number; prunable: boolean }> = {
   critical: { init: 1.0, rate: 0, prunable: false },
@@ -129,6 +129,10 @@ export function initSchema(db: DB): void {
       kind TEXT PRIMARY KEY,
       enabled INTEGER NOT NULL DEFAULT 0,
       path TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
   `)
   ensureFileTargets(db)
@@ -347,13 +351,14 @@ export function maintain(db: DB, force = false): MaintainReport {
     db.prepare("DELETE FROM memories WHERE id = ?").run(id)
   }
   report.pruned = pruneIds.length
+  const cap = getCapRows(db)
   let total = countFacts(db)
-  if (total > CAP_ROWS) {
+  if (total > cap) {
     const extra = (db
       .prepare(
         `SELECT id FROM memories WHERE rank IN ('medium','low') AND kind != 'debt' ORDER BY weight ASC, accesses ASC LIMIT ?`,
       )
-      .all(total - CAP_ROWS) as any[]).map((r) => r.id as number)
+      .all(total - cap) as any[]).map((r) => r.id as number)
     for (const id of extra) db.prepare("DELETE FROM memories WHERE id = ?").run(id)
     report.capped = extra.length
     total = countFacts(db)

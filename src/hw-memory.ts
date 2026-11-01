@@ -20,7 +20,7 @@ import {
   type Rank,
 } from "./core.ts"
 import { docsFooterLines, removeEntityLine, reSeedFromDocs, syncEntityToFile } from "./docs.ts"
-import { getTarget, isManagedKind, listTargets, setTarget } from "./config.ts"
+import { DEFAULT_CAP_ROWS, getCapRows, getTarget, isManagedKind, listTargets, setCapRows, setTarget } from "./config.ts"
 import {
   commandSignature,
   extractFromAssistantText,
@@ -127,6 +127,7 @@ function makeTools(root: string, db: DB) {
         `by source: ${JSON.stringify(stats.bySource)}`,
         `open debt: ${stats.debt}`,
         `avg weight: ${stats.avgWeight.toFixed(3)}`,
+        `cap: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`,
         `db: ${join(root, ".opencode", "hw-memory.db")}`,
         `files: ${listTargets(db).map((t) => `${t.kind}=${t.enabled ? t.path : "off"}`).join("; ")}`,
         `docs: ${docsFooterLines(root, db).join("; ") || "none"}`,
@@ -192,17 +193,29 @@ function makeTools(root: string, db: DB) {
 
   const memoryConfig = defineTextTool({
     description:
-      "Get or set hw-memory managed-file write-back. decision, gotcha and debt can each be enabled/disabled; each writes to its fixed file in docs/hw-memory/ (decisions.md, gotchas.md, debt.md). Disabled means facts live only in the DB.",
+      "Get or set hw-memory configuration for this project. Managed-file write-back: decision, gotcha and debt can each be enabled/disabled; each writes to its fixed file in docs/hw-memory/ (decisions.md, gotchas.md, debt.md). Capacity: cap_rows limits how many facts the DB keeps (default 500); above it the weakest medium/low facts are evicted first and critical/high/debt are never evicted. Lowering cap_rows enforces it immediately.",
     name: "hw_memory_config",
     schema: z.object({
       entity: z.enum(["decision", "gotcha", "debt"]).optional().describe("Entity to configure; omit to list all."),
       enabled: z.boolean().optional().describe("Enable or disable write-back for the entity."),
+      cap_rows: z
+        .number()
+        .int()
+        .optional()
+        .describe("Max facts kept in this project's DB (50..100000); default 500. Lowering enforces it immediately."),
     }),
     async run(args) {
+      if (args.cap_rows !== undefined) {
+        const cap = setCapRows(db, args.cap_rows)
+        const report = maintain(db, true)
+        const evicted = report.capped > 0 ? ` (evicted ${report.capped} over-cap facts)` : ""
+        return `cap_rows: ${cap}${evicted}`
+      }
       if (!args.entity) {
-        return listTargets(db)
-          .map((t) => `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`)
-          .join("\n")
+        return [
+          ...listTargets(db).map((t) => `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`),
+          `cap_rows: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`,
+        ].join("\n")
       }
       const t = setTarget(db, args.entity, { enabled: args.enabled })
       return `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`
