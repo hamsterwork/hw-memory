@@ -20,6 +20,12 @@ You have permanent project memory via hw-memory tools. The project's `docs/` mar
 - `decision`, `gotcha` and `debt` facts live in the DB. Each entity can *optionally* also be written to a markdown file.
 - Fresh installs have all three **disabled** (DB only). Enable them with `hw_memory_config` (`entity`, `enabled`); they write to fixed files `docs/hw-memory/decisions.md`, `gotchas.md`, `debt.md`.
 
+## Capacity (hw_memory_config cap_rows)
+
+- Each project DB keeps at most **500 facts** by default. `hw_memory_config` (`cap_rows`) changes the limit for this project (50..100000).
+- Above the cap, the weakest `medium`/`low` facts are evicted first; `critical`, `high` and `debt` are never evicted.
+- Lowering the cap applies immediately and may evict facts.
+
 ## When to recall (hw_memory_search)
 
 - Before risky or uncertain work, and whenever a past decision, pitfall or constraint might exist.

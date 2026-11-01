@@ -95,11 +95,12 @@ while the DB is open loses the writes it still holds.
 - **Technical debt (`kind: debt`)**: bugs, mismatches and errors noticed while working on an unrelated task. Ranked `medium`…`critical`, never pruned until explicitly resolved (`hw_memory_debt`). The agent is instructed to report new debt before finishing a task.
 - **Managed files (optional)**: `decision`, `gotcha` and `debt` live in the DB. Each entity can separately write back to markdown — `docs/hw-memory/decisions.md`, `gotchas.md`, `debt.md` by default. Fresh installs are DB-only (all disabled); enable per entity with `hw_memory_config`.
 - **Ranks and decay**: critical (never fades), high (slow, never pruned), medium (default), low (fast, pruned below weight 0.2). Debt is exempt from pruning/capping. Access-aware: frequently recalled facts decay slower.
+- **Capacity (configurable)**: each project DB keeps at most 500 facts by default; change it per project with `hw_memory_config` (`cap_rows`). Above the cap the weakest medium/low facts are evicted first; critical/high/debt are never evicted. Lowering the cap applies immediately.
 - **Compaction-safe**: facts are re-injected as compaction context so nothing is lost at context boundaries.
 
 ## Tools
 
-`hw_memory_add`, `hw_memory_search`, `hw_memory_stats`, `hw_memory_forget`, `hw_memory_debt` (list/resolve technical debt), `hw_memory_config` (per-entity managed-file write-back on/off), `hw_memory_seed` (re-sync from docs, dry-run default, explicit user command only).
+`hw_memory_add`, `hw_memory_search`, `hw_memory_stats`, `hw_memory_forget`, `hw_memory_debt` (list/resolve technical debt), `hw_memory_config` (managed-file write-back on/off and the per-project `cap_rows` limit), `hw_memory_seed` (re-sync from docs, dry-run default, explicit user command only).
 
 ## Development
 
