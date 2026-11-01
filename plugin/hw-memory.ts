@@ -1,4 +1,4 @@
-// hw-memory v0.4.1
+// hw-memory v0.5.0
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -12479,6 +12479,26 @@ function setTarget(db, kind, patch) {
 function listTargets(db) {
   return MANAGED_KINDS.map((kind) => getTarget(db, kind));
 }
+var DEFAULT_CAP_ROWS = 500;
+var MIN_CAP_ROWS = 50;
+var MAX_CAP_ROWS = 1e5;
+var CAP_ROWS_KEY = "cap_rows";
+function getCapRows(db) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(CAP_ROWS_KEY);
+  const value = row ? Number.parseInt(String(row.value), 10) : Number.NaN;
+  if (!Number.isFinite(value) || value < MIN_CAP_ROWS || value > MAX_CAP_ROWS) return DEFAULT_CAP_ROWS;
+  return value;
+}
+function setCapRows(db, value) {
+  const cap = Math.trunc(value);
+  if (!Number.isFinite(cap) || cap < MIN_CAP_ROWS || cap > MAX_CAP_ROWS) {
+    throw new Error(`cap_rows must be an integer between ${MIN_CAP_ROWS} and ${MAX_CAP_ROWS}`);
+  }
+  db.prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).run(CAP_ROWS_KEY, String(cap));
+  return cap;
+}
 
 // src/util.ts
 import { createHash } from "node:crypto";
@@ -12670,7 +12690,6 @@ function titleFrom(content, keywords = []) {
 // src/core.ts
 var BASE_RATE = 8e-3;
 var PRUNE_WEIGHT = 0.2;
-var CAP_ROWS = 500;
 var RANK_TABLE = {
   critical: { init: 1, rate: 0, prunable: false },
   high: { init: 1, rate: BASE_RATE * 0.5, prunable: false },
@@ -12742,6 +12761,10 @@ function initSchema(db) {
       kind TEXT PRIMARY KEY,
       enabled INTEGER NOT NULL DEFAULT 0,
       path TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     );
   `);
   ensureFileTargets(db);
@@ -12919,11 +12942,12 @@ function maintain(db, force = false) {
     db.prepare("DELETE FROM memories WHERE id = ?").run(id);
   }
   report.pruned = pruneIds.length;
+  const cap = getCapRows(db);
   let total = countFacts(db);
-  if (total > CAP_ROWS) {
+  if (total > cap) {
     const extra = db.prepare(
       `SELECT id FROM memories WHERE rank IN ('medium','low') AND kind != 'debt' ORDER BY weight ASC, accesses ASC LIMIT ?`
-    ).all(total - CAP_ROWS).map((r) => r.id);
+    ).all(total - cap).map((r) => r.id);
     for (const id of extra) db.prepare("DELETE FROM memories WHERE id = ?").run(id);
     report.capped = extra.length;
     total = countFacts(db);
@@ -13611,6 +13635,7 @@ function makeTools(root, db) {
         `by source: ${JSON.stringify(stats.bySource)}`,
         `open debt: ${stats.debt}`,
         `avg weight: ${stats.avgWeight.toFixed(3)}`,
+        `cap: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`,
         `db: ${join2(root, ".opencode", "hw-memory.db")}`,
         `files: ${listTargets(db).map((t) => `${t.kind}=${t.enabled ? t.path : "off"}`).join("; ")}`,
         `docs: ${docsFooterLines(root, db).join("; ") || "none"}`
@@ -13667,15 +13692,25 @@ function makeTools(root, db) {
     }
   });
   const memoryConfig = defineTextTool({
-    description: "Get or set hw-memory managed-file write-back. decision, gotcha and debt can each be enabled/disabled; each writes to its fixed file in docs/hw-memory/ (decisions.md, gotchas.md, debt.md). Disabled means facts live only in the DB.",
+    description: "Get or set hw-memory configuration for this project. Managed-file write-back: decision, gotcha and debt can each be enabled/disabled; each writes to its fixed file in docs/hw-memory/ (decisions.md, gotchas.md, debt.md). Capacity: cap_rows limits how many facts the DB keeps (default 500); above it the weakest medium/low facts are evicted first and critical/high/debt are never evicted. Lowering cap_rows enforces it immediately.",
     name: "hw_memory_config",
     schema: external_exports.object({
       entity: external_exports.enum(["decision", "gotcha", "debt"]).optional().describe("Entity to configure; omit to list all."),
-      enabled: external_exports.boolean().optional().describe("Enable or disable write-back for the entity.")
+      enabled: external_exports.boolean().optional().describe("Enable or disable write-back for the entity."),
+      cap_rows: external_exports.number().int().optional().describe("Max facts kept in this project's DB (50..100000); default 500. Lowering enforces it immediately.")
     }),
     async run(args) {
+      if (args.cap_rows !== void 0) {
+        const cap = setCapRows(db, args.cap_rows);
+        const report = maintain(db, true);
+        const evicted = report.capped > 0 ? ` (evicted ${report.capped} over-cap facts)` : "";
+        return `cap_rows: ${cap}${evicted}`;
+      }
       if (!args.entity) {
-        return listTargets(db).map((t2) => `${t2.kind}: ${t2.enabled ? "enabled" : "disabled"} -> ${t2.path}`).join("\n");
+        return [
+          ...listTargets(db).map((t2) => `${t2.kind}: ${t2.enabled ? "enabled" : "disabled"} -> ${t2.path}`),
+          `cap_rows: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`
+        ].join("\n");
       }
       const t = setTarget(db, args.entity, { enabled: args.enabled });
       return `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`;
