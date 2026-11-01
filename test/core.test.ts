@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { DB } from "../src/db.ts"
 import { openDBFile } from "../src/db.ts"
+import { setCapRows } from "../src/config.ts"
 import {
   addFact,
   clampDebtRank,
@@ -183,6 +184,30 @@ test("maintain cap enforcement keeps crucial rows", async () => {
   assert.ok(keeper)
   db3.close()
   rmSync(dir3, { recursive: true, force: true })
+})
+
+test("maintain honours the configured cap_rows", async () => {
+  const dir4 = mkdtempSync(join(tmpdir(), "hwm-cap-config-"))
+  const db4 = await openDBFile(join(dir4, "hw-memory.db"))
+  initSchema(db4)
+  setCapRows(db4, 50)
+  const insert = db4.prepare(
+    `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
+     VALUES (?, ?, '', ?, ?, 1.0, 0, 'auto', NULL, NULL, ?, NULL)`,
+  )
+  const now = new Date().toISOString()
+  for (let i = 0; i < 52; i++) insert.run(`filler medium fact ${i}`, `hash-c${i}`, "fact", "medium", now)
+  insert.run("protected critical decision", "hash-crit", "decision", "critical", now)
+  insert.run("protected debt item", "hash-debt", "debt", "medium", now)
+  const report = maintain(db4, true)
+  assert.equal(report.capped, 4)
+  assert.equal(report.total, 50, "cap_rows keeps at most fifty facts")
+  const rows = db4.prepare("SELECT content FROM memories").all() as any[]
+  const contents = rows.map((r) => r.content)
+  assert.ok(contents.includes("protected critical decision"))
+  assert.ok(contents.includes("protected debt item"))
+  db4.close()
+  rmSync(dir4, { recursive: true, force: true })
 })
 
 test("forget removes fact", () => {

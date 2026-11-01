@@ -174,6 +174,25 @@ test("extractSessionDecisions skips non-assistant messages and repeats", async (
   assert.match(stored[0], /sqlite/)
 })
 
+test("config exposes and sets cap_rows", async () => {
+  const { root, tools, cleanup } = await setup()
+  const before = text(await tools.hw_memory_config.execute({}))
+  assert.match(before, /cap_rows: 500 \(default 500\)/)
+
+  const set = text(await tools.hw_memory_config.execute({ cap_rows: 1500 }))
+  assert.match(set, /cap_rows: 1500/)
+
+  const after = text(await tools.hw_memory_config.execute({}))
+  assert.match(after, /cap_rows: 1500 \(default 500\)/)
+
+  const stats = text(await tools.hw_memory_stats.execute({}))
+  assert.match(stats, /cap: 1500 \(default 500\)/)
+
+  await assert.rejects(tools.hw_memory_config.execute({ cap_rows: 10 }), /cap_rows must be an integer/)
+  await cleanup()
+  rmSync(root, { recursive: true, force: true })
+})
+
 test("cleanup unloads the plugin and closes the database", async () => {
   const { root, cleanup } = await setup()
   await cleanup()
