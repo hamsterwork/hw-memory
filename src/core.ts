@@ -3,7 +3,15 @@ import { DEFAULT_CAP_ROWS, ensureFileTargets, getCapRows } from "./config.ts"
 import { contentHash, daysSince, ftsQuery, nowISO, similarityScore, tokenSet } from "./util.ts"
 
 export type Rank = "critical" | "high" | "medium" | "low"
-export type Kind = "decision" | "gotcha" | "debt" | "error" | "dependency" | "fact" | "changelog"
+export type Kind =
+  | "decision"
+  | "gotcha"
+  | "debt"
+  | "changelog"
+  | "reminder"
+  | "error"
+  | "dependency"
+  | "fact"
 export type Source = "auto" | "agent" | "seed"
 
 export const BASE_RATE = 0.008
@@ -30,6 +38,8 @@ export interface FactRow {
   accesses: number
   source: Source
   origin: string | null
+  scope: string | null
+  obsolete_at: string | null
   last_verified_at: string | null
   created_at: string
   last_accessed_at: string | null
@@ -42,6 +52,7 @@ export interface AddInput {
   rank?: Rank
   source?: Source
   origin?: string
+  scope?: string
   verified?: string
   exact?: boolean
 }
@@ -56,7 +67,28 @@ export interface AddResult {
 }
 
 export function isCrucial(kind: Kind, rank: Rank): boolean {
-  return kind === "decision" || kind === "gotcha" || kind === "debt" || rank === "critical" || rank === "high"
+  return (
+    kind === "decision" ||
+    kind === "gotcha" ||
+    kind === "debt" ||
+    kind === "changelog" ||
+    kind === "reminder" ||
+    rank === "critical" ||
+    rank === "high"
+  )
+}
+
+/** Kinds that are never removed by decay, pruning or the row cap. */
+export function isNeverPrunedKind(kind: Kind): boolean {
+  return kind === "debt" || kind === "reminder" || kind === "changelog"
+}
+
+/** Obsolete high/critical decisions and gotchas lose their prune protection. */
+export function isProtectedFromPrune(fact: Pick<FactRow, "kind" | "rank" | "obsolete_at">): boolean {
+  if (isNeverPrunedKind(fact.kind)) return true
+  if (fact.rank === "critical") return true
+  if (fact.rank !== "high") return false
+  return !(fact.obsolete_at && (fact.kind === "decision" || fact.kind === "gotcha"))
 }
 
 export function clampDebtRank(rank?: Rank): Rank {
@@ -94,6 +126,13 @@ function normalizeSeedOrigins(db: DB): void {
     }
   }
 }
+
+function ensureColumn(db: DB, table: string, name: string, sql: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+  if (!cols.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${sql}`)
+}
+
+export const SCHEMA_VERSION = 1
 
 export function initSchema(db: DB): void {
   db.exec(`
@@ -134,13 +173,77 @@ export function initSchema(db: DB): void {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS seed_scopes (
+      path TEXT PRIMARY KEY,
+      kind TEXT NOT NULL DEFAULT 'file',
+      last_seen_hash TEXT NOT NULL DEFAULT '',
+      last_seeded_hash TEXT NOT NULL DEFAULT '',
+      size INTEGER NOT NULL DEFAULT 0,
+      mtime_ms INTEGER NOT NULL DEFAULT 0,
+      files INTEGER NOT NULL DEFAULT 0,
+      skipped INTEGER NOT NULL DEFAULT 0,
+      last_seeded_at TEXT DEFAULT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS doc_manifest (
+      fact_id INTEGER PRIMARY KEY,
+      file TEXT NOT NULL,
+      heading TEXT NOT NULL DEFAULT '',
+      line_hash TEXT NOT NULL,
+      owner TEXT NOT NULL DEFAULT 'plugin',
+      origin TEXT DEFAULT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS change_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      session_id TEXT DEFAULT NULL,
+      source TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      ref TEXT DEFAULT NULL
+    );
+    CREATE TABLE IF NOT EXISTS version_checkpoints (
+      label TEXT PRIMARY KEY,
+      commit_sha TEXT DEFAULT NULL,
+      journal_seq INTEGER DEFAULT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS pending_doc_updates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fact_id INTEGER NOT NULL,
+      file TEXT NOT NULL,
+      heading TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL,
+      reason TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'proposed',
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS pending_prunes (
+      fact_id INTEGER PRIMARY KEY,
+      kind TEXT NOT NULL,
+      rank TEXT NOT NULL,
+      content TEXT NOT NULL,
+      weight REAL NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `)
+
+  ensureColumn(db, "memories", "scope", "scope TEXT DEFAULT NULL")
+  ensureColumn(db, "memories", "obsolete_at", "obsolete_at TEXT DEFAULT NULL")
+  ensureColumn(db, "seed_scopes", "line_hashes", "line_hashes TEXT NOT NULL DEFAULT ''")
   ensureFileTargets(db)
   normalizeSeedOrigins(db)
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_seed_origin
        ON memories(origin) WHERE source = 'seed' AND origin IS NOT NULL;`,
   )
+  db.prepare(
+    `UPDATE memories SET scope = CASE WHEN instr(origin, '#') > 0
+       THEN substr(origin, 1, instr(origin, '#') - 1) ELSE origin END
+     WHERE source = 'seed' AND origin IS NOT NULL AND scope IS NULL`,
+  ).run()
+  const version = (db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined)?.user_version ?? 0
+  if (version < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
 }
 
 export function effectiveAgeDays(row: Pick<FactRow, "created_at" | "last_verified_at">): number {
@@ -165,6 +268,8 @@ function rowToFact(r: any): FactRow {
     accesses: r.accesses as number,
     source: r.source as Source,
     origin: (r.origin ?? null) as string | null,
+    scope: (r.scope ?? null) as string | null,
+    obsolete_at: (r.obsolete_at ?? null) as string | null,
     last_verified_at: (r.last_verified_at ?? null) as string | null,
     created_at: r.created_at as string,
     last_accessed_at: (r.last_accessed_at ?? null) as string | null,
@@ -230,8 +335,8 @@ export function addFact(db: DB, input: AddInput): AddResult {
   const weight = RANK_TABLE[rank].init
   const info = db
     .prepare(
-      `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+      `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, scope, last_verified_at, created_at, last_accessed_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       content,
@@ -242,6 +347,7 @@ export function addFact(db: DB, input: AddInput): AddResult {
       weight,
       input.source ?? "auto",
       input.origin ?? null,
+      input.scope ?? null,
       input.verified ?? null,
       now,
       now,
@@ -315,27 +421,64 @@ export interface MaintainReport {
   pruned: number
   capped: number
   promoted: number
+  proposed: number
+  obsoleted: number
   total: number
 }
 
 const lastMaintain = new WeakMap<DB, number>()
 
+const emptyMaintain = (db: DB): MaintainReport => ({
+  decayed: 0,
+  pruned: 0,
+  capped: 0,
+  promoted: 0,
+  proposed: 0,
+  obsoleted: 0,
+  total: countFacts(db),
+})
+
+function proposePrune(db: DB, fact: FactRow, weight: number): boolean {
+  const info = db
+    .prepare(
+      `INSERT OR IGNORE INTO pending_prunes (fact_id, kind, rank, content, weight, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(fact.id, fact.kind, fact.rank, fact.content, weight, nowISO()) as any
+  return (info.changes ?? 0) > 0
+}
+
 export function maintain(db: DB, force = false): MaintainReport {
   const now = Date.now()
-  if (!force && lastMaintain.has(db) && now - (lastMaintain.get(db) as number) < 3_600_000) {
-    return { decayed: 0, pruned: 0, capped: 0, promoted: 0, total: countFacts(db) }
-  }
+  if (!force && lastMaintain.has(db) && now - (lastMaintain.get(db) as number) < 3_600_000) return emptyMaintain(db)
   lastMaintain.set(db, now)
-  const report: MaintainReport = { decayed: 0, pruned: 0, capped: 0, promoted: 0, total: 0 }
+  const report: MaintainReport = {
+    decayed: 0,
+    pruned: 0,
+    capped: 0,
+    promoted: 0,
+    proposed: 0,
+    obsoleted: 0,
+    total: 0,
+  }
   const rows = db.prepare("SELECT * FROM memories").all() as any[]
   const updates: { id: number; rank: Rank; weight: number }[] = []
   const pruneIds: number[] = []
   for (const r of rows) {
     const fact = rowToFact(r)
     let rank = promoteRank(fact.rank, fact.accesses)
+    if (fact.obsolete_at && (fact.kind === "decision" || fact.kind === "gotcha") && fact.rank !== "low") {
+      rank = "low"
+      report.obsoleted++
+    }
     const weight = computeWeight(rank, fact.accesses, effectiveAgeDays(fact))
     if (rank !== fact.rank) report.promoted++
-    if (fact.kind !== "debt" && RANK_TABLE[rank].prunable && weight < PRUNE_WEIGHT) {
+    const protectedFact = isProtectedFromPrune({ ...fact, rank })
+    if (!protectedFact && weight < PRUNE_WEIGHT && !isNeverPrunedKind(fact.kind)) {
+      if (rank === "medium" && (fact.kind === "decision" || fact.kind === "gotcha")) {
+        if (proposePrune(db, fact, weight)) report.proposed++
+        continue
+      }
       pruneIds.push(fact.id)
       continue
     }
@@ -343,24 +486,30 @@ export function maintain(db: DB, force = false): MaintainReport {
       updates.push({ id: fact.id, rank, weight })
     }
   }
-  report.decayed = updates.length
   for (const u of updates) {
     db.prepare("UPDATE memories SET weight = ?, rank = ? WHERE id = ?").run(u.weight, u.rank, u.id)
   }
+  report.decayed = updates.length
   for (const id of pruneIds) {
     db.prepare("DELETE FROM memories WHERE id = ?").run(id)
+    db.prepare("DELETE FROM pending_prunes WHERE fact_id = ?").run(id)
   }
   report.pruned = pruneIds.length
+
   const cap = getCapRows(db)
   let total = countFacts(db)
   if (total > cap) {
-    const extra = (db
-      .prepare(
-        `SELECT id FROM memories WHERE rank IN ('medium','low') AND kind != 'debt' ORDER BY weight ASC, accesses ASC LIMIT ?`,
-      )
-      .all(total - cap) as any[]).map((r) => r.id as number)
-    for (const id of extra) db.prepare("DELETE FROM memories WHERE id = ?").run(id)
-    report.capped = extra.length
+    const remaining = (db.prepare("SELECT * FROM memories").all() as any[])
+      .map(rowToFact)
+      .filter((f) => !isNeverPrunedKind(f.kind) && !isProtectedFromPrune(f))
+      .filter((f) => !(f.rank === "medium" && (f.kind === "decision" || f.kind === "gotcha")))
+      .sort((a, b) => a.weight - b.weight || a.accesses - b.accesses)
+      .slice(0, total - cap)
+    for (const f of remaining) {
+      db.prepare("DELETE FROM memories WHERE id = ?").run(f.id)
+      db.prepare("DELETE FROM pending_prunes WHERE fact_id = ?").run(f.id)
+    }
+    report.capped = remaining.length
     total = countFacts(db)
   }
   report.total = total
@@ -369,7 +518,61 @@ export function maintain(db: DB, force = false): MaintainReport {
 
 export function forgetFact(db: DB, id: number): boolean {
   const res = db.prepare("DELETE FROM memories WHERE id = ?").run(id) as any
+  if ((res.changes ?? 0) > 0) {
+    db.prepare("DELETE FROM pending_prunes WHERE fact_id = ?").run(id)
+    db.prepare("DELETE FROM pending_doc_updates WHERE fact_id = ?").run(id)
+    db.prepare("DELETE FROM doc_manifest WHERE fact_id = ?").run(id)
+  }
   return (res.changes ?? 0) > 0
+}
+
+export function listFactsByKind(db: DB, kind: Kind): FactRow[] {
+  return (db
+    .prepare("SELECT * FROM memories WHERE kind = ? ORDER BY weight DESC, created_at DESC")
+    .all(kind) as any[]).map(rowToFact)
+}
+
+export function listReminders(db: DB): FactRow[] {
+  return listFactsByKind(db, "reminder")
+}
+
+export function listChangelog(db: DB): FactRow[] {
+  return listFactsByKind(db, "changelog")
+}
+
+export function markObsolete(db: DB, id: number): boolean {
+  const res = db
+    .prepare("UPDATE memories SET obsolete_at = ? WHERE id = ? AND obsolete_at IS NULL")
+    .run(nowISO(), id) as any
+  return (res.changes ?? 0) > 0
+}
+
+export interface PendingPruneRow {
+  fact_id: number
+  kind: Kind
+  rank: Rank
+  content: string
+  weight: number
+  created_at: string
+}
+
+export function listPendingPrunes(db: DB): PendingPruneRow[] {
+  return (db.prepare("SELECT * FROM pending_prunes ORDER BY weight ASC, created_at ASC").all() as any[]).map((r) => ({
+    fact_id: r.fact_id as number,
+    kind: r.kind as Kind,
+    rank: r.rank as Rank,
+    content: r.content as string,
+    weight: r.weight as number,
+    created_at: r.created_at as string,
+  }))
+}
+
+export function resolvePrune(db: DB, id: number, approved: boolean): boolean {
+  const row = db.prepare("SELECT fact_id FROM pending_prunes WHERE fact_id = ?").get(id) as any
+  if (!row) return false
+  if (approved) forgetFact(db, id)
+  else db.prepare("DELETE FROM pending_prunes WHERE fact_id = ?").run(id)
+  return true
 }
 
 export function forgetKind(db: DB, kind: Kind): number {
@@ -379,19 +582,24 @@ export function forgetKind(db: DB, kind: Kind): number {
 
 export function listDebt(db: DB): FactRow[] {
   return (db
-    .prepare("SELECT * FROM memories WHERE kind = 'debt' ORDER BY weight DESC, created_at DESC")
+    .prepare("SELECT * FROM memories WHERE kind = 'debt' AND obsolete_at IS NULL ORDER BY weight DESC, created_at DESC")
     .all() as any[]).map(rowToFact)
 }
 
 export function countDebt(db: DB): number {
-  return (db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'debt'").get() as any).c as number
+  return (db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'debt' AND obsolete_at IS NULL").get() as any)
+    .c as number
 }
 
+/**
+ * Mark a debt resolved without deleting it: it stops appearing in debt lists,
+ * and its exact plugin-written doc line is removed on the next `/hw-docs --apply`.
+ */
 export function resolveDebt(db: DB, id: number): FactRow | null {
   const fact = getFact(db, id)
-  if (!fact || fact.kind !== "debt") return null
-  forgetFact(db, id)
-  return fact
+  if (!fact || fact.kind !== "debt" || fact.obsolete_at) return null
+  markObsolete(db, id)
+  return getFact(db, id)
 }
 
 export interface StatsReport {
@@ -425,11 +633,11 @@ export function statsFacts(db: DB): StatsReport {
     bySource,
     avgWeight: rows.length ? weightSum / rows.length : 0,
     oldest,
-    debt: byKind["debt"] ?? 0,
+    debt: countDebt(db),
   }
 }
 
-export function wakeUpPack(db: DB, docsFooter: string[], charBudget = 2500): string {
+export function wakeUpPack(db: DB, charBudget = 2500): string {
   const crucial = (db
     .prepare("SELECT * FROM memories WHERE rank IN ('critical','high') ORDER BY weight DESC LIMIT 12")
     .all() as any[]).map(rowToFact)
@@ -438,10 +646,9 @@ export function wakeUpPack(db: DB, docsFooter: string[], charBudget = 2500): str
     .all() as any[]).map(rowToFact)
   const lines: string[] = ["## hw-memory — persistent project memory (top facts)"]
   const debtTotal = countDebt(db)
-  if (crucial.length === 0 && medium.length === 0 && debtTotal === 0) {
-    lines.push(
-      "Memory DB is empty. If this project has docs/, suggest the user run hw_memory_seed (dry-run report first, then apply=true).",
-    )
+  const reminderTotal = (db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'reminder'").get() as any).c as number
+  if (crucial.length === 0 && medium.length === 0 && debtTotal === 0 && reminderTotal === 0) {
+    lines.push("Memory DB is empty. Suggest the user run /hw-seed <path> to import notes or docs.")
   }
   let used = lines.join("\n").length
   const push = (f: FactRow) => {
@@ -454,17 +661,17 @@ export function wakeUpPack(db: DB, docsFooter: string[], charBudget = 2500): str
   for (const f of [...crucial, ...medium]) {
     if (!push(f)) break
   }
-  const debt = (db
-    .prepare("SELECT * FROM memories WHERE kind = 'debt' ORDER BY weight DESC LIMIT 5")
-    .all() as any[]).map(rowToFact)
   if (debtTotal > 0) {
     lines.push("", `## Open technical debt (${debtTotal}) — tell the user about new items before finishing`)
-    for (const f of debt) {
+    for (const f of listDebt(db).slice(0, 5)) {
       if (!push(f)) break
     }
   }
-  if (docsFooter.length > 0) {
-    lines.push("", "## Authoritative docs (source of truth)", ...docsFooter.map((d) => `- ${d}`))
+  if (reminderTotal > 0) {
+    lines.push("", `## Open reminders (${reminderTotal})`)
+    for (const f of listReminders(db).slice(0, 5)) {
+      if (!push(f)) break
+    }
   }
   lines.push("", "Use hw_memory_search tool to recall more.")
   return lines.join("\n")

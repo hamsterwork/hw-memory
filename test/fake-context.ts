@@ -14,19 +14,30 @@ export interface FakeTool {
 
 export type FakeHook = (event: any) => void | Promise<void>
 
+export interface FakeCommand {
+  name: string
+  description?: string
+  execute: (input: { sessionID: string; prompt: { text: string }; delivery: string }) => Promise<void>
+}
+
 export interface FakePluginContext {
   ctx: any
   tools: Record<string, FakeTool>
+  commands: Record<string, FakeCommand>
   hooks: Record<string, FakeHook[]>
+  output: { synthetic: string[]; prompt: string[] }
   pushEvent: (event: { type: string; data: any }) => void
   callHook: (name: string, event: any) => Promise<void>
+  runCommand: (name: string, text?: string) => Promise<void>
 }
 
 const registration = () => ({ dispose: async () => {} })
 
 export function fakeContext(root: string, messages: unknown[] = []): FakePluginContext {
   const tools: Record<string, FakeTool> = {}
+  const commands: Record<string, FakeCommand> = {}
   const hooks: Record<string, FakeHook[]> = {}
+  const output: { synthetic: string[]; prompt: string[] } = { synthetic: [], prompt: [] }
   const queue: { type: string; data: any }[] = []
   let wake: (() => void) | undefined
 
@@ -67,13 +78,35 @@ export function fakeContext(root: string, messages: unknown[] = []): FakePluginC
       },
       list: async () => Object.values(tools),
     },
+    command: {
+      transform: async (cb: (editor: any) => void) => {
+        cb({
+          add: (command: FakeCommand) => {
+            commands[command.name] = command
+          },
+          list: () => Object.values(commands),
+        })
+        return registration()
+      },
+      reload: async () => {},
+      list: async () => Object.values(commands),
+    },
     session: {
       context: async () => messages,
       hook: async (name: string, cb: FakeHook) => {
         ;(hooks[name] ??= []).push(cb)
         return registration()
       },
+      synthetic: async ({ text }: { text: string }) => {
+        output.synthetic.push(text)
+        return {}
+      },
+      prompt: async ({ text }: { text: string }) => {
+        output.prompt.push(text)
+        return {}
+      },
     },
+    vcs: { status: async () => ({ files: [] }) },
     event: { subscribe: (options?: { signal?: AbortSignal }) => stream(options?.signal) },
     storage: {},
   }
@@ -88,7 +121,13 @@ export function fakeContext(root: string, messages: unknown[] = []): FakePluginC
     wake = undefined
   }
 
-  return { ctx, tools, hooks, pushEvent, callHook }
+  const runCommand = async (name: string, text = "") => {
+    const command = commands[name]
+    if (!command) throw new Error(`unknown fake command: ${name}`)
+    await command.execute({ sessionID: "test-session", prompt: { text }, delivery: "steer" })
+  }
+
+  return { ctx, tools, commands, hooks, output, pushEvent, callHook, runCommand }
 }
 
 export function text(result: { content?: string }): string {

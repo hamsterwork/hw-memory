@@ -18,10 +18,16 @@ import {
   getFact,
   initSchema,
   isCrucial,
+  isNeverPrunedKind,
+  isProtectedFromPrune,
   listDebt,
+  listPendingPrunes,
+  listReminders,
   maintain,
+  markObsolete,
   promoteRank,
   resolveDebt,
+  resolvePrune,
   searchFacts,
   setRank,
   statsFacts,
@@ -239,10 +245,10 @@ test("stats and wake-up pack render", () => {
   const stats = statsFacts(db)
   assert.ok(stats.total > 0)
   assert.ok(stats.byRank)
-  const pack = wakeUpPack(db, ["docs/decisions.md", "docs/gotchas.md"])
+  const pack = wakeUpPack(db)
   assert.ok(pack.includes("## hw-memory"))
-  assert.ok(pack.includes("Authoritative docs"))
   assert.ok(pack.includes("hw_memory_search"))
+  assert.ok(!pack.includes("Authoritative docs"))
   assert.ok(pack.length < 3000)
 })
 
@@ -257,9 +263,9 @@ test("wakeUpPack suggests seeding when memory is empty", async () => {
   const dirE = mkdtempSync(join(tmpdir(), "hwm-empty-"))
   const dbE = await openDBFile(join(dirE, "hw-memory.db"))
   initSchema(dbE)
-  const pack = wakeUpPack(dbE, [])
+  const pack = wakeUpPack(dbE)
   assert.ok(pack.includes("Memory DB is empty"))
-  assert.ok(pack.includes("hw_memory_seed"))
+  assert.ok(pack.includes("/hw-seed"))
   dbE.close()
   rmSync(dirE, { recursive: true, force: true })
 })
@@ -276,14 +282,18 @@ test("debt rank clamps low to medium and keeps high/critical", () => {
   assert.equal(crit.rank, "critical")
 })
 
-test("debt is listed, counted and resolved by deletion", () => {
+test("debt is listed, counted and resolved by obsolescence", () => {
   const res = addFact(db, { content: "mismatch between API contract and serializers", kind: "debt", rank: "high" })
-  assert.ok(countDebt(db) >= 1)
+  const before = countDebt(db)
+  assert.ok(before >= 1)
   assert.ok(listDebt(db).some((d) => d.id === res.id))
   const resolved = resolveDebt(db, res.id)
   assert.ok(resolved)
-  assert.equal(getFact(db, res.id), null)
-  assert.equal(resolveDebt(db, res.id), null)
+  assert.ok(resolved.obsolete_at)
+  assert.equal(countDebt(db), before - 1, "resolved debt leaves the open-debt count")
+  assert.ok(!listDebt(db).some((d) => d.id === res.id))
+  assert.equal(resolveDebt(db, res.id), null, "resolving twice is a no-op")
+  assert.ok(getFact(db, res.id), "resolving keeps a tombstone so /hw-docs can remove its exact line")
 })
 
 test("maintain never prunes or caps debt regardless of rank", async () => {
@@ -376,4 +386,98 @@ test("genuine near-duplicate keeps stored content and bumps accesses", async () 
     assert.equal(fact.content, "The parser uses a Pratt algorithm for expressions")
     assert.equal(fact.accesses, 1)
   })
+})
+
+test("never-pruned kinds and prune protection classify correctly", () => {
+  for (const kind of ["debt", "reminder", "changelog"] as const) assert.equal(isNeverPrunedKind(kind), true)
+  for (const kind of ["fact", "decision", "gotcha", "error", "dependency"] as const) {
+    assert.equal(isNeverPrunedKind(kind), false)
+  }
+  assert.equal(isProtectedFromPrune({ kind: "decision", rank: "critical", obsolete_at: "2020-01-01" }), true)
+  assert.equal(isProtectedFromPrune({ kind: "decision", rank: "high", obsolete_at: null }), true)
+  assert.equal(isProtectedFromPrune({ kind: "decision", rank: "high", obsolete_at: "2020-01-01" }), false)
+  assert.equal(isProtectedFromPrune({ kind: "gotcha", rank: "high", obsolete_at: "2020-01-01" }), false)
+  assert.equal(isProtectedFromPrune({ kind: "reminder", rank: "low", obsolete_at: "2020-01-01" }), true)
+})
+
+test("maintain proposes medium decision prunes and approves through pending_prunes", async () => {
+  await withTempDB(async (tdb) => {
+    const old = "2020-01-01T00:00:00.000Z"
+    tdb.prepare(
+      `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
+       VALUES (?, ?, '', 'decision', 'medium', 0.01, 0, 'agent', NULL, NULL, ?, NULL)`,
+    ).run("decayed medium decision awaiting approval", "hash-md", old)
+    const report = maintain(tdb, true)
+    assert.equal(report.pruned, 0, "medium decisions are not silently removed")
+    assert.equal(report.proposed, 1)
+    const pending = listPendingPrunes(tdb)
+    assert.equal(pending.length, 1)
+    assert.equal(pending[0].kind, "decision")
+    assert.equal(getFact(tdb, pending[0].fact_id)?.content, "decayed medium decision awaiting approval")
+    assert.equal(resolvePrune(tdb, pending[0].fact_id, false), true)
+    assert.equal(getFact(tdb, pending[0].fact_id) !== null, true, "rejection keeps the fact")
+    assert.equal(listPendingPrunes(tdb).length, 0)
+    assert.equal(resolvePrune(tdb, pending[0].fact_id, true), false, "resolved proposal is gone")
+  })
+})
+
+test("obsolete high decisions demote to low and are then silently pruned", async () => {
+  await withTempDB(async (tdb) => {
+    const old = "2020-01-01T00:00:00.000Z"
+    tdb.prepare(
+      `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
+       VALUES (?, ?, '', 'decision', 'high', 0.01, 0, 'agent', NULL, NULL, ?, NULL)`,
+    ).run("obsolete high decision that lost its source file", "hash-ob", old)
+    const id = (tdb.prepare("SELECT id FROM memories").get() as any).id as number
+    assert.equal(markObsolete(tdb, id), true)
+    assert.equal(markObsolete(tdb, id), false)
+    const report = maintain(tdb, true)
+    assert.equal(report.obsoleted, 1)
+    assert.equal(report.pruned, 1, "obsolete high is no longer protected")
+    assert.equal(getFact(tdb, id), null)
+  })
+})
+
+test("reminder and changelog facts survive decay and the row cap", async () => {
+  await withTempDB(async (tdb) => {
+    const old = "2020-01-01T00:00:00.000Z"
+    const insert = tdb.prepare(
+      `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
+       VALUES (?, ?, '', ?, 'low', 0.01, 0, 'agent', NULL, NULL, ?, NULL)`,
+    )
+    insert.run("old reminder that must survive", "hash-rm", "reminder", old)
+    insert.run("old changelog entry that must survive", "hash-cl", "changelog", old)
+    insert.run("old ephemeral observation", "hash-ep", "fact", old)
+    const report = maintain(tdb, true)
+    assert.equal(report.pruned, 1)
+    assert.equal(listReminders(tdb).length, 1)
+    assert.equal(listReminders(tdb)[0].content, "old reminder that must survive")
+    assert.equal((tdb.prepare("SELECT content FROM memories WHERE kind='changelog'").all() as any[])[0].content,
+      "old changelog entry that must survive")
+  })
+})
+
+test("initSchema normalizes legacy duplicate seed origins and enforces the unique index", async () => {
+  const origin = "docs/legacy.md#section-1"
+  const root = mkdtempSync(join(tmpdir(), "hwm-norm-"))
+  const dbx = await openDBFile(join(root, "hw-memory.db"))
+  initSchema(dbx)
+  dbx.exec("DROP INDEX IF EXISTS ux_memories_seed_origin")
+  const insert = (content: string, hash: string, rank: string, accesses: number) =>
+    dbx
+      .prepare(
+        `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
+         VALUES (?, ?, '', 'fact', ?, 1.0, ?, 'seed', ?, NULL, '2026-01-01T00:00:00.000Z', NULL)`,
+      )
+      .run(content, hash, rank, accesses, origin)
+  insert("legacy duplicate alpha", "h-alpha", "medium", 1)
+  insert("legacy duplicate beta", "h-beta", "high", 3)
+  initSchema(dbx)
+  const rows = dbx.prepare("SELECT rank, accesses FROM memories WHERE origin = ?").all(origin) as any[]
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].rank, "high")
+  assert.equal(rows[0].accesses, 4)
+  assert.throws(() => insert("another duplicate", "h-gamma", "medium", 0))
+  dbx.close()
+  rmSync(root, { recursive: true, force: true })
 })

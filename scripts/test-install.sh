@@ -46,7 +46,7 @@ bash "$installer" "$proj" >/dev/null
 check "project: plugin installed" test -f "$proj/.opencode/plugins/hw-memory.ts"
 check "project: AGENTS.md created" test -f "$proj/AGENTS.md"
 check "project: one marker block" test "$(marker_count "$proj/AGENTS.md")" = 1
-check "project: rules content present" grep -qF 'hw_memory_seed' "$proj/AGENTS.md"
+check "project: rules content present" grep -qF '/hw-seed' "$proj/AGENTS.md"
 check "project: WAL gitignored" grep -qxF '.opencode/hw-memory.db-wal' "$proj/.gitignore"
 check "project: SHM gitignored" grep -qxF '.opencode/hw-memory.db-shm' "$proj/.gitignore"
 

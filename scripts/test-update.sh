@@ -82,7 +82,7 @@ check "update: plugin replaced" test "$(plugin_version "$proj/.opencode/plugins/
 check "update: backup kept old version" test "$(plugin_version "$proj/.opencode/plugins/hw-memory.ts.bak")" = "0.1.0"
 check "update: existing content preserved" grep -qF 'keep me' "$proj/AGENTS.md"
 check "update: rules block present" test "$(marker_count "$proj/AGENTS.md")" = 1
-check "update: rules content present" grep -qF 'hw_memory_seed' "$proj/AGENTS.md"
+check "update: rules content present" grep -qF '/hw-seed' "$proj/AGENTS.md"
 
 # --- 2. no-op when already current -----------------------------------------
 out="$(bash "$updater" "$proj" --version "$tag" --base-url "$release" --yes 2>&1)"

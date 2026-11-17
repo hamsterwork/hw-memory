@@ -14,13 +14,24 @@ import {
   resolveDebt,
   searchFacts,
   statsFacts,
-  updateOrigin,
   wakeUpPack,
   type Kind,
   type Rank,
 } from "./core.ts"
-import { docsFooterLines, removeEntityLine, reSeedFromDocs, syncEntityToFile } from "./docs.ts"
-import { DEFAULT_CAP_ROWS, getCapRows, getTarget, isManagedKind, listTargets, setCapRows, setTarget } from "./config.ts"
+import { queueDocUpdate, noteToolFileChange, scanDrift } from "./doc-sync.ts"
+import { registerCommands } from "./commands.ts"
+import {
+  DEFAULT_CAP_ROWS,
+  getCapRows,
+  getChangelogSource,
+  getChangelogSummary,
+  isManagedKind,
+  listTargets,
+  setCapRows,
+  setChangelogSource,
+  setChangelogSummary,
+  setTarget,
+} from "./config.ts"
 import {
   commandSignature,
   extractFromAssistantText,
@@ -69,9 +80,9 @@ function makeTools(root: string, db: DB) {
       content: z.string().describe("One dense fact, single sentence or two. Language-agnostic."),
       keywords: z.string().optional().describe("3-6 comma-separated terms that boost keyword search."),
       kind: z
-        .enum(["decision", "gotcha", "debt", "error", "dependency", "fact", "changelog"])
+        .enum(["decision", "gotcha", "debt", "changelog", "reminder", "error", "dependency", "fact"])
         .optional()
-        .describe("Fact category. decision/gotcha/debt are also written to their managed file when enabled."),
+        .describe("Fact category. reminder stores plans, open questions and refactor notes; changelog stores release notes."),
       rank: z
         .enum(["critical", "high", "medium", "low"])
         .optional()
@@ -89,8 +100,9 @@ function makeTools(root: string, db: DB) {
       })
       let note = ""
       if (res.status === "inserted" && isManagedKind(res.kind)) {
-        const sync = syncEntityToFile(db, root, res.kind)
-        if (sync.written > 0) note = ` Also written to ${sync.file}.`
+        if (queueDocUpdate(db, { id: res.id, kind: res.kind, content: args.content, origin: null })) {
+          note = " Doc update proposed — run /hw-docs to review."
+        }
       }
       const debtNote =
         res.kind === "debt" ? " ⚠ Technical debt recorded — tell the user about it before finishing the task." : ""
@@ -130,7 +142,6 @@ function makeTools(root: string, db: DB) {
         `cap: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`,
         `db: ${join(root, ".opencode", "hw-memory.db")}`,
         `files: ${listTargets(db).map((t) => `${t.kind}=${t.enabled ? t.path : "off"}`).join("; ")}`,
-        `docs: ${docsFooterLines(root, db).join("; ") || "none"}`,
       ]
       return lines.join("\n")
     },
@@ -145,30 +156,9 @@ function makeTools(root: string, db: DB) {
     },
   })
 
-  const memorySeed = defineTextTool({
-    description:
-      "Seed or re-sync memory from docs/ markdown. On an empty DB this is the first-time seed; afterwards it imports new facts, updates changed, demotes vanished, and reports crucial facts missing from docs. Direct user command only — never run on your own initiative. Default is a dry-run report; apply with apply=true.",
-    name: "hw_memory_seed",
-    schema: z.object({ apply: z.boolean().optional().describe("Apply changes. Default false (dry-run report).") }),
-    async run(args) {
-      const report = reSeedFromDocs(db, root, args.apply ?? false)
-      const lines = [
-        `${report.apply ? "APPLIED" : "DRY-RUN"} re-seed: files=${report.files} docFacts=${report.docFacts}`,
-        `inserted=${report.inserted} updatedContent=${report.updatedContent} rebound=${report.rebound} demoted=${report.demoted} merged=${report.merged} unchanged=${report.unchanged}`,
-      ]
-      if (report.missingFromDocs.length > 0) {
-        lines.push("", `Crucial facts present in memory but missing from docs (${report.missingFromDocs.length}):`)
-        for (const m of report.missingFromDocs.slice(0, 20)) {
-          lines.push(`- #${m.id} [${m.rank}/${m.kind}] ${m.content}`)
-        }
-      }
-      return lines.join("\n")
-    },
-  })
-
   const memoryDebt = defineTextTool({
     description:
-      "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id removes it (and its line from the managed debt file when enabled). Always tell the user about new debt before finishing a task.",
+      "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id marks it resolved (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
     name: "hw_memory_debt",
     schema: z.object({
       action: z.enum(["list", "resolve"]).optional().describe("list (default) or resolve."),
@@ -179,9 +169,7 @@ function makeTools(root: string, db: DB) {
         if (args.id == null) return "Provide the debt id to resolve."
         const fact = resolveDebt(db, args.id)
         if (!fact) return `#${args.id} is not an open debt item.`
-        const target = getTarget(db, "debt")
-        if (target.enabled) removeEntityLine(root, target.path, fact.content)
-        return `Resolved and removed debt #${args.id}.`
+        return `Resolved debt #${args.id}. Its managed-doc line, if any, is removed on /hw-docs --apply.`
       }
       const rows = listDebt(db)
       if (rows.length === 0) return "No open technical debt."
@@ -193,16 +181,27 @@ function makeTools(root: string, db: DB) {
 
   const memoryConfig = defineTextTool({
     description:
-      "Get or set hw-memory configuration for this project. Managed-file write-back: decision, gotcha and debt can each be enabled/disabled; each writes to its fixed file in docs/hw-memory/ (decisions.md, gotchas.md, debt.md). Capacity: cap_rows limits how many facts the DB keeps (default 500); above it the weakest medium/low facts are evicted first and critical/high/debt are never evicted. Lowering cap_rows enforces it immediately.",
+      "Get or set hw-memory configuration for this project. Managed docs: decision, gotcha, debt, reminder and changelog can each be enabled/disabled; each writes to docs/hw-memory/ only after /hw-docs --apply. Capacity: cap_rows limits how many facts the DB keeps (default 500); debt, reminders and changelog are never evicted. Changelog: changelog_source (auto|git|journal) and changelog_summary (deterministic|ai). Lowering cap_rows enforces it immediately.",
     name: "hw_memory_config",
     schema: z.object({
-      entity: z.enum(["decision", "gotcha", "debt"]).optional().describe("Entity to configure; omit to list all."),
+      entity: z
+        .enum(["decision", "gotcha", "debt", "reminder", "changelog"])
+        .optional()
+        .describe("Entity to configure; omit to list all."),
       enabled: z.boolean().optional().describe("Enable or disable write-back for the entity."),
       cap_rows: z
         .number()
         .int()
         .optional()
         .describe("Max facts kept in this project's DB (50..100000); default 500. Lowering enforces it immediately."),
+      changelog_source: z
+        .enum(["auto", "git", "journal"])
+        .optional()
+        .describe("Changelog source: auto (git when available), git or journal."),
+      changelog_summary: z
+        .enum(["deterministic", "ai"])
+        .optional()
+        .describe("Changelog summary style: deterministic bullets or AI opt-in."),
     }),
     async run(args) {
       if (args.cap_rows !== undefined) {
@@ -211,10 +210,14 @@ function makeTools(root: string, db: DB) {
         const evicted = report.capped > 0 ? ` (evicted ${report.capped} over-cap facts)` : ""
         return `cap_rows: ${cap}${evicted}`
       }
+      if (args.changelog_source !== undefined) return `changelog.source: ${setChangelogSource(db, args.changelog_source)}`
+      if (args.changelog_summary !== undefined) return `changelog.summary: ${setChangelogSummary(db, args.changelog_summary)}`
       if (!args.entity) {
         return [
           ...listTargets(db).map((t) => `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`),
           `cap_rows: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`,
+          `changelog.source: ${getChangelogSource(db)}`,
+          `changelog.summary: ${getChangelogSummary(db)}`,
         ].join("\n")
       }
       const t = setTarget(db, args.entity, { enabled: args.enabled })
@@ -222,7 +225,7 @@ function makeTools(root: string, db: DB) {
     },
   })
 
-  return [memoryAdd, memorySearch, memoryStats, memoryForget, memorySeed, memoryDebt, memoryConfig]
+  return [memoryAdd, memorySearch, memoryStats, memoryForget, memoryDebt, memoryConfig]
 }
 
 function registerTools(editor: ToolEditor, root: string, db: DB): void {
@@ -278,6 +281,8 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
     initSchema(db)
     const tracker = new SessionTracker()
     const controller = new AbortController()
+    const forceScan = new Set<string>()
+    let lastScan = 0
 
     const storeCandidate = (sessionID: string, candidate: Candidate, origin?: string) => {
       addFact(db, {
@@ -295,17 +300,28 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
       if (!fact || fact.kind !== "error") return
       db.prepare("UPDATE memories SET kind = 'gotcha', rank = 'high', weight = 1.0, last_verified_at = ? WHERE id = ?")
         .run(new Date().toISOString(), id)
-      const sync = syncEntityToFile(db, root, "gotcha")
-      if (sync.written > 0 && sync.origin) updateOrigin(db, id, sync.origin)
+      queueDocUpdate(db, { id, kind: "gotcha", content: fact.content, origin: fact.origin }, undefined, undefined, "error promoted to gotcha")
     }
 
     const pack = () => {
       maintain(db)
-      return wakeUpPack(db, docsFooterLines(root, db))
+      return wakeUpPack(db)
     }
 
     // The DB is open and the schema is in place before the synchronous transform runs.
     await ctx.tool.transform((editor) => registerTools(editor, root, db))
+    await registerCommands(ctx, db, root)
+
+    await ctx.session.hook("prompt", (event) => {
+      try {
+        const text = String(event?.prompt?.text ?? "").toLowerCase()
+        if (/(task finished|finished the task|task complete|done|готово|завершено)/.test(text)) {
+          forceScan.add(event.sessionID)
+        }
+      } catch {
+        // A prompt hook must never break admission.
+      }
+    })
 
     await ctx.session.hook("context", (event) => {
       try {
@@ -335,8 +351,16 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
 
     await ctx.tool.hook("execute.after", (event) => {
       try {
-        if (event.tool !== "bash") return
         if (event.status !== "completed") return
+        const fileTools = ["write", "edit", "patch", "apply_patch", "multitool"]
+        if (fileTools.includes(event.tool)) {
+          const input = event.input as Record<string, unknown> | undefined
+          const pathValue = input?.path ?? input?.file ?? input?.filePath ?? input?.filename
+          if (typeof pathValue === "string" && pathValue.length > 0) {
+            noteToolFileChange(db, event.sessionID, pathValue, `${event.tool}: ${pathValue}`)
+          }
+        }
+        if (event.tool !== "bash") return
         const cmd = typeof (event.input as { command?: unknown } | undefined)?.command === "string"
           ? ((event.input as { command: string }).command)
           : ""
@@ -373,6 +397,22 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
         await extractSessionDecisions(sessionID, messages, tracker, (id, candidate) => storeCandidate(id, candidate))
       } catch (e) {
         console.error("hw-memory assistant extraction failed:", e)
+      }
+      try {
+        const forced = forceScan.delete(sessionID)
+        if (!forced && Date.now() - lastScan < 3_600_000) return
+        lastScan = Date.now()
+        const drift = scanDrift(db, root, { force: true })
+        if (drift.length === 0) return
+        const lines = drift.map(
+          (d) => `- ${d.path}: +${d.added} -${d.removed} ~${d.changed}${d.agentAttributed ? " (agent edit)" : ""}`,
+        )
+        await ctx.session.synthetic({
+          sessionID,
+          text: ["## hw-memory: seeded files changed", ...lines, "", "Run /hw-seed <path> to review."].join("\n"),
+        })
+      } catch (e) {
+        console.error("hw-memory drift scan failed:", e)
       }
     }
 

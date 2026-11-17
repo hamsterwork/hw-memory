@@ -1,8 +1,14 @@
 import type { DB } from "./db.ts"
 
-export type ManagedKind = "decision" | "gotcha" | "debt"
+export type ChangelogSourceSetting = "auto" | "git" | "journal"
+export type ChangelogSummarySetting = "deterministic" | "ai"
 
-export const MANAGED_KINDS: ManagedKind[] = ["decision", "gotcha", "debt"]
+export const DEFAULT_CHANGELOG_SOURCE: ChangelogSourceSetting = "auto"
+export const DEFAULT_CHANGELOG_SUMMARY: ChangelogSummarySetting = "deterministic"
+
+export type ManagedKind = "decision" | "gotcha" | "debt" | "reminder" | "changelog"
+
+export const MANAGED_KINDS: ManagedKind[] = ["decision", "gotcha", "debt", "reminder", "changelog"]
 
 export const MANAGED_DIR = "docs/hw-memory"
 
@@ -10,6 +16,8 @@ export const DEFAULT_TARGET_PATH: Record<ManagedKind, string> = {
   decision: `${MANAGED_DIR}/decisions.md`,
   gotcha: `${MANAGED_DIR}/gotchas.md`,
   debt: `${MANAGED_DIR}/debt.md`,
+  reminder: `${MANAGED_DIR}/reminders.md`,
+  changelog: `${MANAGED_DIR}/changelog.md`,
 }
 
 export interface FileTarget {
@@ -66,14 +74,49 @@ export function getCapRows(db: DB): number {
   return value
 }
 
+function setSetting(db: DB, key: string, value: string): void {
+  db.prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run(key, value)
+}
+
+function getSetting(db: DB, key: string): string | null {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as any
+  return row ? String(row.value) : null
+}
+
 /** Store the cap for this project. Throws when out of bounds. */
 export function setCapRows(db: DB, value: number): number {
   const cap = Math.trunc(value)
   if (!Number.isFinite(cap) || cap < MIN_CAP_ROWS || cap > MAX_CAP_ROWS) {
     throw new Error(`cap_rows must be an integer between ${MIN_CAP_ROWS} and ${MAX_CAP_ROWS}`)
   }
-  db.prepare(
-    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-  ).run(CAP_ROWS_KEY, String(cap))
+  setSetting(db, CAP_ROWS_KEY, String(cap))
   return cap
+}
+
+export function getChangelogSource(db: DB): ChangelogSourceSetting {
+  const value = getSetting(db, "changelog.source")
+  return value === "git" || value === "journal" || value === "auto" ? value : DEFAULT_CHANGELOG_SOURCE
+}
+
+export function setChangelogSource(db: DB, value: string): ChangelogSourceSetting {
+  if (value !== "auto" && value !== "git" && value !== "journal") {
+    throw new Error("changelog.source must be auto, git or journal")
+  }
+  setSetting(db, "changelog.source", value)
+  return value
+}
+
+export function getChangelogSummary(db: DB): ChangelogSummarySetting {
+  const value = getSetting(db, "changelog.summary")
+  return value === "ai" || value === "deterministic" ? value : DEFAULT_CHANGELOG_SUMMARY
+}
+
+export function setChangelogSummary(db: DB, value: string): ChangelogSummarySetting {
+  if (value !== "deterministic" && value !== "ai") {
+    throw new Error("changelog.summary must be deterministic or ai")
+  }
+  setSetting(db, "changelog.summary", value)
+  return value
 }

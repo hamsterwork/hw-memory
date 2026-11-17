@@ -1,4 +1,4 @@
-// hw-memory v0.5.0
+// hw-memory v1.0.0
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -6,7 +6,7 @@ var __export = (target, all) => {
 };
 
 // src/hw-memory.ts
-import { join as join2 } from "node:path";
+import { join as join4 } from "node:path";
 
 // node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -12446,12 +12446,16 @@ async function openDBFile(path) {
 }
 
 // src/config.ts
-var MANAGED_KINDS = ["decision", "gotcha", "debt"];
+var DEFAULT_CHANGELOG_SOURCE = "auto";
+var DEFAULT_CHANGELOG_SUMMARY = "deterministic";
+var MANAGED_KINDS = ["decision", "gotcha", "debt", "reminder", "changelog"];
 var MANAGED_DIR = "docs/hw-memory";
 var DEFAULT_TARGET_PATH = {
   decision: `${MANAGED_DIR}/decisions.md`,
   gotcha: `${MANAGED_DIR}/gotchas.md`,
-  debt: `${MANAGED_DIR}/debt.md`
+  debt: `${MANAGED_DIR}/debt.md`,
+  reminder: `${MANAGED_DIR}/reminders.md`,
+  changelog: `${MANAGED_DIR}/changelog.md`
 };
 function isManagedKind(kind) {
   return MANAGED_KINDS.includes(kind);
@@ -12489,15 +12493,44 @@ function getCapRows(db) {
   if (!Number.isFinite(value) || value < MIN_CAP_ROWS || value > MAX_CAP_ROWS) return DEFAULT_CAP_ROWS;
   return value;
 }
+function setSetting(db, key, value) {
+  db.prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).run(key, value);
+}
+function getSetting(db, key) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key);
+  return row ? String(row.value) : null;
+}
 function setCapRows(db, value) {
   const cap = Math.trunc(value);
   if (!Number.isFinite(cap) || cap < MIN_CAP_ROWS || cap > MAX_CAP_ROWS) {
     throw new Error(`cap_rows must be an integer between ${MIN_CAP_ROWS} and ${MAX_CAP_ROWS}`);
   }
-  db.prepare(
-    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-  ).run(CAP_ROWS_KEY, String(cap));
+  setSetting(db, CAP_ROWS_KEY, String(cap));
   return cap;
+}
+function getChangelogSource(db) {
+  const value = getSetting(db, "changelog.source");
+  return value === "git" || value === "journal" || value === "auto" ? value : DEFAULT_CHANGELOG_SOURCE;
+}
+function setChangelogSource(db, value) {
+  if (value !== "auto" && value !== "git" && value !== "journal") {
+    throw new Error("changelog.source must be auto, git or journal");
+  }
+  setSetting(db, "changelog.source", value);
+  return value;
+}
+function getChangelogSummary(db) {
+  const value = getSetting(db, "changelog.summary");
+  return value === "ai" || value === "deterministic" ? value : DEFAULT_CHANGELOG_SUMMARY;
+}
+function setChangelogSummary(db, value) {
+  if (value !== "deterministic" && value !== "ai") {
+    throw new Error("changelog.summary must be deterministic or ai");
+  }
+  setSetting(db, "changelog.summary", value);
+  return value;
 }
 
 // src/util.ts
@@ -12698,7 +12731,16 @@ var RANK_TABLE = {
 };
 var RANK_ORDER = { critical: 3, high: 2, medium: 1, low: 0 };
 function isCrucial(kind, rank) {
-  return kind === "decision" || kind === "gotcha" || kind === "debt" || rank === "critical" || rank === "high";
+  return kind === "decision" || kind === "gotcha" || kind === "debt" || kind === "changelog" || kind === "reminder" || rank === "critical" || rank === "high";
+}
+function isNeverPrunedKind(kind) {
+  return kind === "debt" || kind === "reminder" || kind === "changelog";
+}
+function isProtectedFromPrune(fact) {
+  if (isNeverPrunedKind(fact.kind)) return true;
+  if (fact.rank === "critical") return true;
+  if (fact.rank !== "high") return false;
+  return !(fact.obsolete_at && (fact.kind === "decision" || fact.kind === "gotcha"));
 }
 function clampDebtRank(rank) {
   if (rank === "critical" || rank === "high") return rank;
@@ -12727,6 +12769,11 @@ function normalizeSeedOrigins(db) {
     }
   }
 }
+function ensureColumn(db, table, name, sql) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${sql}`);
+}
+var SCHEMA_VERSION = 1;
 function initSchema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS memories (
@@ -12766,13 +12813,76 @@ function initSchema(db) {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS seed_scopes (
+      path TEXT PRIMARY KEY,
+      kind TEXT NOT NULL DEFAULT 'file',
+      last_seen_hash TEXT NOT NULL DEFAULT '',
+      last_seeded_hash TEXT NOT NULL DEFAULT '',
+      size INTEGER NOT NULL DEFAULT 0,
+      mtime_ms INTEGER NOT NULL DEFAULT 0,
+      files INTEGER NOT NULL DEFAULT 0,
+      skipped INTEGER NOT NULL DEFAULT 0,
+      last_seeded_at TEXT DEFAULT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS doc_manifest (
+      fact_id INTEGER PRIMARY KEY,
+      file TEXT NOT NULL,
+      heading TEXT NOT NULL DEFAULT '',
+      line_hash TEXT NOT NULL,
+      owner TEXT NOT NULL DEFAULT 'plugin',
+      origin TEXT DEFAULT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS change_events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      session_id TEXT DEFAULT NULL,
+      source TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      ref TEXT DEFAULT NULL
+    );
+    CREATE TABLE IF NOT EXISTS version_checkpoints (
+      label TEXT PRIMARY KEY,
+      commit_sha TEXT DEFAULT NULL,
+      journal_seq INTEGER DEFAULT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS pending_doc_updates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fact_id INTEGER NOT NULL,
+      file TEXT NOT NULL,
+      heading TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL,
+      reason TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'proposed',
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS pending_prunes (
+      fact_id INTEGER PRIMARY KEY,
+      kind TEXT NOT NULL,
+      rank TEXT NOT NULL,
+      content TEXT NOT NULL,
+      weight REAL NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
+  ensureColumn(db, "memories", "scope", "scope TEXT DEFAULT NULL");
+  ensureColumn(db, "memories", "obsolete_at", "obsolete_at TEXT DEFAULT NULL");
+  ensureColumn(db, "seed_scopes", "line_hashes", "line_hashes TEXT NOT NULL DEFAULT ''");
   ensureFileTargets(db);
   normalizeSeedOrigins(db);
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS ux_memories_seed_origin
        ON memories(origin) WHERE source = 'seed' AND origin IS NOT NULL;`
   );
+  db.prepare(
+    `UPDATE memories SET scope = CASE WHEN instr(origin, '#') > 0
+       THEN substr(origin, 1, instr(origin, '#') - 1) ELSE origin END
+     WHERE source = 'seed' AND origin IS NOT NULL AND scope IS NULL`
+  ).run();
+  const version2 = db.prepare("PRAGMA user_version").get()?.user_version ?? 0;
+  if (version2 < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
 function effectiveAgeDays(row) {
   const from = row.last_verified_at && row.last_verified_at > row.created_at ? row.last_verified_at : row.created_at;
@@ -12794,6 +12904,8 @@ function rowToFact(r) {
     accesses: r.accesses,
     source: r.source,
     origin: r.origin ?? null,
+    scope: r.scope ?? null,
+    obsolete_at: r.obsolete_at ?? null,
     last_verified_at: r.last_verified_at ?? null,
     created_at: r.created_at,
     last_accessed_at: r.last_accessed_at ?? null
@@ -12850,8 +12962,8 @@ function addFact(db, input) {
   const rank = requestedRank ?? "medium";
   const weight = RANK_TABLE[rank].init;
   const info = db.prepare(
-    `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, last_verified_at, created_at, last_accessed_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`
+    `INSERT INTO memories (content, content_hash, keywords, kind, rank, weight, accesses, source, origin, scope, last_verified_at, created_at, last_accessed_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`
   ).run(
     content,
     contentHash(content),
@@ -12861,6 +12973,7 @@ function addFact(db, input) {
     weight,
     input.source ?? "auto",
     input.origin ?? null,
+    input.scope ?? null,
     input.verified ?? null,
     now,
     now
@@ -12911,22 +13024,53 @@ function searchFacts(db, query, opts = {}) {
   return top;
 }
 var lastMaintain = /* @__PURE__ */ new WeakMap();
+var emptyMaintain = (db) => ({
+  decayed: 0,
+  pruned: 0,
+  capped: 0,
+  promoted: 0,
+  proposed: 0,
+  obsoleted: 0,
+  total: countFacts(db)
+});
+function proposePrune(db, fact, weight) {
+  const info = db.prepare(
+    `INSERT OR IGNORE INTO pending_prunes (fact_id, kind, rank, content, weight, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(fact.id, fact.kind, fact.rank, fact.content, weight, nowISO());
+  return (info.changes ?? 0) > 0;
+}
 function maintain(db, force = false) {
   const now = Date.now();
-  if (!force && lastMaintain.has(db) && now - lastMaintain.get(db) < 36e5) {
-    return { decayed: 0, pruned: 0, capped: 0, promoted: 0, total: countFacts(db) };
-  }
+  if (!force && lastMaintain.has(db) && now - lastMaintain.get(db) < 36e5) return emptyMaintain(db);
   lastMaintain.set(db, now);
-  const report = { decayed: 0, pruned: 0, capped: 0, promoted: 0, total: 0 };
+  const report = {
+    decayed: 0,
+    pruned: 0,
+    capped: 0,
+    promoted: 0,
+    proposed: 0,
+    obsoleted: 0,
+    total: 0
+  };
   const rows = db.prepare("SELECT * FROM memories").all();
   const updates = [];
   const pruneIds = [];
   for (const r of rows) {
     const fact = rowToFact(r);
     let rank = promoteRank(fact.rank, fact.accesses);
+    if (fact.obsolete_at && (fact.kind === "decision" || fact.kind === "gotcha") && fact.rank !== "low") {
+      rank = "low";
+      report.obsoleted++;
+    }
     const weight = computeWeight(rank, fact.accesses, effectiveAgeDays(fact));
     if (rank !== fact.rank) report.promoted++;
-    if (fact.kind !== "debt" && RANK_TABLE[rank].prunable && weight < PRUNE_WEIGHT) {
+    const protectedFact = isProtectedFromPrune({ ...fact, rank });
+    if (!protectedFact && weight < PRUNE_WEIGHT && !isNeverPrunedKind(fact.kind)) {
+      if (rank === "medium" && (fact.kind === "decision" || fact.kind === "gotcha")) {
+        if (proposePrune(db, fact, weight)) report.proposed++;
+        continue;
+      }
       pruneIds.push(fact.id);
       continue;
     }
@@ -12934,22 +13078,24 @@ function maintain(db, force = false) {
       updates.push({ id: fact.id, rank, weight });
     }
   }
-  report.decayed = updates.length;
   for (const u of updates) {
     db.prepare("UPDATE memories SET weight = ?, rank = ? WHERE id = ?").run(u.weight, u.rank, u.id);
   }
+  report.decayed = updates.length;
   for (const id of pruneIds) {
     db.prepare("DELETE FROM memories WHERE id = ?").run(id);
+    db.prepare("DELETE FROM pending_prunes WHERE fact_id = ?").run(id);
   }
   report.pruned = pruneIds.length;
   const cap = getCapRows(db);
   let total = countFacts(db);
   if (total > cap) {
-    const extra = db.prepare(
-      `SELECT id FROM memories WHERE rank IN ('medium','low') AND kind != 'debt' ORDER BY weight ASC, accesses ASC LIMIT ?`
-    ).all(total - cap).map((r) => r.id);
-    for (const id of extra) db.prepare("DELETE FROM memories WHERE id = ?").run(id);
-    report.capped = extra.length;
+    const remaining = db.prepare("SELECT * FROM memories").all().map(rowToFact).filter((f) => !isNeverPrunedKind(f.kind) && !isProtectedFromPrune(f)).filter((f) => !(f.rank === "medium" && (f.kind === "decision" || f.kind === "gotcha"))).sort((a, b) => a.weight - b.weight || a.accesses - b.accesses).slice(0, total - cap);
+    for (const f of remaining) {
+      db.prepare("DELETE FROM memories WHERE id = ?").run(f.id);
+      db.prepare("DELETE FROM pending_prunes WHERE fact_id = ?").run(f.id);
+    }
+    report.capped = remaining.length;
     total = countFacts(db);
   }
   report.total = total;
@@ -12957,19 +13103,54 @@ function maintain(db, force = false) {
 }
 function forgetFact(db, id) {
   const res = db.prepare("DELETE FROM memories WHERE id = ?").run(id);
+  if ((res.changes ?? 0) > 0) {
+    db.prepare("DELETE FROM pending_prunes WHERE fact_id = ?").run(id);
+    db.prepare("DELETE FROM pending_doc_updates WHERE fact_id = ?").run(id);
+    db.prepare("DELETE FROM doc_manifest WHERE fact_id = ?").run(id);
+  }
   return (res.changes ?? 0) > 0;
 }
+function listFactsByKind(db, kind) {
+  return db.prepare("SELECT * FROM memories WHERE kind = ? ORDER BY weight DESC, created_at DESC").all(kind).map(rowToFact);
+}
+function listReminders(db) {
+  return listFactsByKind(db, "reminder");
+}
+function listChangelog(db) {
+  return listFactsByKind(db, "changelog");
+}
+function markObsolete(db, id) {
+  const res = db.prepare("UPDATE memories SET obsolete_at = ? WHERE id = ? AND obsolete_at IS NULL").run(nowISO(), id);
+  return (res.changes ?? 0) > 0;
+}
+function listPendingPrunes(db) {
+  return db.prepare("SELECT * FROM pending_prunes ORDER BY weight ASC, created_at ASC").all().map((r) => ({
+    fact_id: r.fact_id,
+    kind: r.kind,
+    rank: r.rank,
+    content: r.content,
+    weight: r.weight,
+    created_at: r.created_at
+  }));
+}
+function resolvePrune(db, id, approved) {
+  const row = db.prepare("SELECT fact_id FROM pending_prunes WHERE fact_id = ?").get(id);
+  if (!row) return false;
+  if (approved) forgetFact(db, id);
+  else db.prepare("DELETE FROM pending_prunes WHERE fact_id = ?").run(id);
+  return true;
+}
 function listDebt(db) {
-  return db.prepare("SELECT * FROM memories WHERE kind = 'debt' ORDER BY weight DESC, created_at DESC").all().map(rowToFact);
+  return db.prepare("SELECT * FROM memories WHERE kind = 'debt' AND obsolete_at IS NULL ORDER BY weight DESC, created_at DESC").all().map(rowToFact);
 }
 function countDebt(db) {
-  return db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'debt'").get().c;
+  return db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'debt' AND obsolete_at IS NULL").get().c;
 }
 function resolveDebt(db, id) {
   const fact = getFact(db, id);
-  if (!fact || fact.kind !== "debt") return null;
-  forgetFact(db, id);
-  return fact;
+  if (!fact || fact.kind !== "debt" || fact.obsolete_at) return null;
+  markObsolete(db, id);
+  return getFact(db, id);
 }
 function statsFacts(db) {
   const rows = db.prepare("SELECT rank, kind, source, weight, created_at FROM memories").all();
@@ -12992,18 +13173,17 @@ function statsFacts(db) {
     bySource,
     avgWeight: rows.length ? weightSum / rows.length : 0,
     oldest,
-    debt: byKind["debt"] ?? 0
+    debt: countDebt(db)
   };
 }
-function wakeUpPack(db, docsFooter, charBudget = 2500) {
+function wakeUpPack(db, charBudget = 2500) {
   const crucial = db.prepare("SELECT * FROM memories WHERE rank IN ('critical','high') ORDER BY weight DESC LIMIT 12").all().map(rowToFact);
   const medium = db.prepare("SELECT * FROM memories WHERE rank = 'medium' ORDER BY weight DESC LIMIT 5").all().map(rowToFact);
   const lines = ["## hw-memory \u2014 persistent project memory (top facts)"];
   const debtTotal = countDebt(db);
-  if (crucial.length === 0 && medium.length === 0 && debtTotal === 0) {
-    lines.push(
-      "Memory DB is empty. If this project has docs/, suggest the user run hw_memory_seed (dry-run report first, then apply=true)."
-    );
+  const reminderTotal = db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'reminder'").get().c;
+  if (crucial.length === 0 && medium.length === 0 && debtTotal === 0 && reminderTotal === 0) {
+    lines.push("Memory DB is empty. Suggest the user run /hw-seed <path> to import notes or docs.");
   }
   let used = lines.join("\n").length;
   const push = (f) => {
@@ -13016,26 +13196,25 @@ function wakeUpPack(db, docsFooter, charBudget = 2500) {
   for (const f of [...crucial, ...medium]) {
     if (!push(f)) break;
   }
-  const debt = db.prepare("SELECT * FROM memories WHERE kind = 'debt' ORDER BY weight DESC LIMIT 5").all().map(rowToFact);
   if (debtTotal > 0) {
     lines.push("", `## Open technical debt (${debtTotal}) \u2014 tell the user about new items before finishing`);
-    for (const f of debt) {
+    for (const f of listDebt(db).slice(0, 5)) {
       if (!push(f)) break;
     }
   }
-  if (docsFooter.length > 0) {
-    lines.push("", "## Authoritative docs (source of truth)", ...docsFooter.map((d) => `- ${d}`));
+  if (reminderTotal > 0) {
+    lines.push("", `## Open reminders (${reminderTotal})`);
+    for (const f of listReminders(db).slice(0, 5)) {
+      if (!push(f)) break;
+    }
   }
   lines.push("", "Use hw_memory_search tool to recall more.");
   return lines.join("\n");
 }
-function updateOrigin(db, id, origin) {
-  db.prepare("UPDATE memories SET origin = ? WHERE id = ?").run(origin, id);
-}
 
-// src/docs.ts
-import { existsSync, mkdirSync as mkdirSync2, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+// src/doc-sync.ts
+import { mkdirSync as mkdirSync2, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname as dirname2, isAbsolute, join } from "node:path";
 
 // src/fs.ts
 import { statSync } from "node:fs";
@@ -13054,409 +13233,1473 @@ function isDir(path) {
   }
 }
 
-// src/docs.ts
-function managedRank(kind) {
-  if (kind === "decision") return "critical";
-  if (kind === "gotcha") return "high";
-  return "medium";
+// src/doc-sync.ts
+var KIND_TITLE = {
+  decision: "Decision",
+  gotcha: "Gotcha",
+  debt: "Debt",
+  reminder: "Reminder",
+  changelog: "Changelog"
+};
+var FILE_TITLE = {
+  [DEFAULT_TARGET_PATH.decision]: "Decisions",
+  [DEFAULT_TARGET_PATH.gotcha]: "Gotchas",
+  [DEFAULT_TARGET_PATH.debt]: "Technical Debt",
+  [DEFAULT_TARGET_PATH.reminder]: "Reminders",
+  [DEFAULT_TARGET_PATH.changelog]: "Changelog"
+};
+function kindTitle(kind) {
+  return isManagedKind(kind) ? KIND_TITLE[kind] : titleFrom(kind);
 }
-function rankForPath(rel) {
-  const p = rel.replaceAll("\\", "/").toLowerCase();
-  if (p.startsWith(".opencode/") || p.startsWith("node_modules/")) return null;
-  const base = p.split("/").pop() ?? p;
-  if (base === "decisions.md") return { kind: "decision", rank: "critical" };
-  if (base === "gotchas.md") return { kind: "gotcha", rank: "high" };
-  if (base === "debt.md") return { kind: "debt", rank: "medium" };
-  if (base === "context.md") return { kind: "fact", rank: "high" };
-  if (p.startsWith("docs/architecture/")) return { kind: "fact", rank: "high" };
-  if (p.startsWith("docs/rules/")) return { kind: "decision", rank: "critical" };
-  if (p.startsWith("docs/roles/")) return { kind: "fact", rank: "medium" };
-  if (base === "changelog.md") return { kind: "changelog", rank: "low" };
-  if (p === "agents.md" || p === "readme.md") return { kind: "fact", rank: "medium" };
-  if (p.startsWith("docs/") && base.endsWith(".md")) return { kind: "fact", rank: "medium" };
-  return null;
+function fileTitle(rel) {
+  if (FILE_TITLE[rel]) return FILE_TITLE[rel];
+  return basename(rel).replace(/\.md$/i, "").split(/[-_.]+/).filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join(" ") || "Notes";
 }
-function slugify(text) {
-  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "") || "doc";
+function cleanContent(content) {
+  return stripMarkdown(content).replace(/\s+/g, " ").trim();
 }
-function parseDocFile(absPath, rel, override) {
-  const mapping = override ?? rankForPath(rel);
-  if (!mapping) return [];
-  let text;
+function renderBullet(content, kind, rank) {
+  const prefix = kind === "debt" ? `[${rank ?? "medium"}] ` : "";
+  return `- ${prefix}${cleanContent(content)}`;
+}
+function resolvePath(root, rel) {
+  return isAbsolute(rel) ? rel : join(root, rel);
+}
+function kindFromFile(rel) {
+  for (const kind of MANAGED_KINDS) if (DEFAULT_TARGET_PATH[kind] === rel) return kind;
+  const base = basename(rel).toLowerCase();
+  for (const kind of MANAGED_KINDS) if (base.includes(kind)) return kind;
+  return "fact";
+}
+function queueDocUpdate(db, fact, file2, heading, reason) {
+  const rel = file2?.trim() || (isManagedKind(fact.kind) ? DEFAULT_TARGET_PATH[fact.kind] : "");
+  if (!rel) return false;
+  if (isManagedKind(fact.kind) && !getTarget(db, fact.kind).enabled) return false;
+  const content = cleanContent(fact.content);
+  const existing = db.prepare(
+    `SELECT id FROM pending_doc_updates
+       WHERE fact_id = ? AND file = ? AND content = ? AND status IN ('proposed','queued') LIMIT 1`
+  ).get(fact.id, rel, content);
+  if (existing) return false;
+  db.prepare(
+    `INSERT INTO pending_doc_updates (fact_id, file, heading, content, reason, status, created_at)
+     VALUES (?, ?, ?, ?, ?, 'proposed', ?)`
+  ).run(fact.id, rel, heading?.trim() || kindTitle(fact.kind), content, reason?.trim() || "new crucial fact", nowISO());
+  return true;
+}
+function listDocUpdates(db) {
+  const rows = db.prepare(
+    `SELECT id, fact_id, file, heading, content, reason FROM pending_doc_updates
+       WHERE status IN ('proposed','queued') ORDER BY id`
+  ).all();
+  return rows.map((r) => ({
+    id: Number(r.id),
+    factId: Number(r.fact_id),
+    file: String(r.file),
+    heading: String(r.heading ?? ""),
+    content: String(r.content ?? ""),
+    reason: String(r.reason ?? "")
+  }));
+}
+function parseLineHashes(raw) {
+  if (typeof raw !== "string" || raw.trim() === "") return [];
   try {
-    text = readFileSync(absPath, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
   } catch {
     return [];
   }
-  const facts = [];
-  const lines = text.split(/\r?\n/);
-  let inFence = false;
-  let section = "";
-  let contextDate = null;
-  const stem = (rel.split("/").pop() ?? rel).replace(/\.md$/i, "");
-  const anchorCounters = /* @__PURE__ */ new Map();
-  const usedAnchors = /* @__PURE__ */ new Set();
-  const bulletRe = /^(?:[-*+]|\d+[.)])\s+/;
-  const headingRe = /^#{1,6}\s+/;
-  const fenceRe = /^(```|~~~)/;
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const trimmed = raw.trim();
-    if (fenceRe.test(trimmed)) {
-      inFence = !inFence;
-      continue;
+}
+function compareLineHashes(before, after) {
+  const n = before.length;
+  const m = after.length;
+  const lcs = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i2 = n - 1; i2 >= 0; i2--) {
+    for (let j2 = m - 1; j2 >= 0; j2--) {
+      lcs[i2][j2] = before[i2] === after[j2] ? lcs[i2 + 1][j2 + 1] + 1 : Math.max(lcs[i2 + 1][j2], lcs[i2][j2 + 1]);
     }
-    if (inFence) continue;
-    const lineDate = parseVerifiedDate(trimmed);
-    if (lineDate) contextDate = lineDate;
-    if (trimmed.startsWith("|")) continue;
-    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
-    if (heading) {
-      section = stripMarkdown(heading[2]);
-      continue;
-    }
-    const bullet = trimmed.match(/^(?:[-*+]|\d+[.)])\s+(.+)$/);
-    if (!bullet) continue;
-    let text2 = bullet[1];
-    let j = i + 1;
-    while (j < lines.length) {
-      const next = lines[j];
-      const nextTrimmed = next.trim();
-      if (nextTrimmed === "") break;
-      if (!/^\s/.test(next)) break;
-      if (fenceRe.test(nextTrimmed) || bulletRe.test(nextTrimmed) || headingRe.test(nextTrimmed) || nextTrimmed.startsWith("|"))
-        break;
-      const contDate = parseVerifiedDate(nextTrimmed);
-      if (contDate) contextDate = contDate;
-      text2 += ` ${nextTrimmed}`;
+  }
+  let added = 0;
+  let removed = 0;
+  let changed = 0;
+  let deleted = 0;
+  let inserted = 0;
+  const flush = () => {
+    const pairs = Math.min(deleted, inserted);
+    changed += pairs;
+    removed += deleted - pairs;
+    added += inserted - pairs;
+    deleted = 0;
+    inserted = 0;
+  };
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (before[i] === after[j]) {
+      flush();
+      i++;
+      j++;
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+      deleted++;
+      i++;
+    } else {
+      inserted++;
       j++;
     }
-    i = j - 1;
-    const numbered = trimmed.match(/^(\d+)[.)]\s+/);
-    const content = stripMarkdown(text2).replace(/\s+/g, " ").trim();
-    if (content.length < 25) continue;
-    const verified = parseVerifiedDate(content) ?? contextDate;
-    let anchor;
-    if (numbered) {
-      anchor = numbered[1];
-      if (usedAnchors.has(anchor)) {
-        const base = slugify(section || stem);
-        anchor = `${base}-${numbered[1]}`;
-        let k = 1;
-        while (usedAnchors.has(anchor)) anchor = `${base}-${numbered[1]}-${++k}`;
-      }
-    } else {
-      const base = slugify(section || stem);
-      let n = (anchorCounters.get(base) ?? 0) + 1;
-      anchor = `${base}-${n}`;
-      while (usedAnchors.has(anchor)) anchor = `${base}-${++n}`;
-      anchorCounters.set(base, n);
-    }
-    usedAnchors.add(anchor);
-    const keywords = keywordsFrom(content, [stem, ...tokenize(section).slice(0, 3)]);
-    facts.push({
-      content,
-      hash: contentHash(content),
-      keywords,
-      kind: mapping.kind,
-      rank: mapping.rank,
-      origin: `${rel}#${anchor}`,
-      verified
-    });
   }
-  return facts;
+  deleted += n - i;
+  inserted += m - j;
+  flush();
+  return { added, removed, changed };
 }
-function discoverDocFiles(root, targets = []) {
+function listFiles(abs) {
   const out = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const rel of ["AGENTS.md", "README.md", "CHANGELOG.md"]) {
-    const abs = join(root, rel);
-    if (isFile(abs)) {
-      out.push({ abs, rel });
-      seen.add(rel);
+  const walk = (dir, prefix) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === ".opencode" || entry.name === "node_modules") continue;
+      const child = join(dir, entry.name);
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(child, rel);
+      else if (entry.isFile()) out.push({ abs: child, rel });
     }
-  }
-  const docsDir = join(root, "docs");
-  if (isDir(docsDir)) {
-    for (const entry of readdirSync(docsDir, { recursive: true })) {
-      const rel = `docs/${entry.replaceAll("\\", "/")}`;
-      if (!rel.endsWith(".md")) continue;
-      if (seen.has(rel)) continue;
-      if (rankForPath(rel) === null) continue;
-      out.push({ abs: join(root, rel), rel });
-      seen.add(rel);
-    }
-  }
-  for (const t of targets) {
-    if (!t.enabled || seen.has(t.path)) continue;
-    const abs = join(root, t.path);
-    if (!isFile(abs)) continue;
-    out.push({ abs, rel: t.path, override: { kind: t.kind, rank: managedRank(t.kind) } });
-    seen.add(t.path);
-  }
-  return out.sort((a, b) => a.rel.localeCompare(b.rel));
+  };
+  walk(abs, "");
+  return out;
 }
-function mergeDuplicate(db, hash2, dropId) {
-  const owner = db.prepare("SELECT id, rank, accesses FROM memories WHERE content_hash = ?").get(hash2);
-  if (!owner || owner.id === dropId) return;
-  const drop = db.prepare("SELECT rank, accesses FROM memories WHERE id = ?").get(dropId);
-  if (!drop) return;
+function folderHash(files) {
+  return contentHash(
+    files.map((f) => `${f.rel}\0${contentHash(readFileSync(f.abs, "utf8"))}`).sort().join("\n")
+  );
+}
+function normalizedRef(root, ref) {
+  const rootNorm = root.replaceAll("\\", "/");
+  let value = ref.replaceAll("\\", "/");
+  if (value.startsWith(`${rootNorm}/`)) value = value.slice(rootNorm.length + 1);
+  return value.replace(/^\.\//, "");
+}
+function scanDrift(db, root, opts) {
+  void opts?.force;
+  const scopes = db.prepare("SELECT * FROM seed_scopes ORDER BY path").all();
+  const events = db.prepare("SELECT ref, created_at FROM change_events WHERE source = 'agent-tool'").all();
+  const out = [];
+  for (const scope of scopes) {
+    const path = String(scope.path);
+    const abs = resolvePath(root, path);
+    const seededAt = scope.last_seeded_at ? String(scope.last_seeded_at) : "";
+    const lastSeenHash = String(scope.last_seen_hash ?? "");
+    const storedLines = parseLineHashes(scope.line_hashes);
+    const isFolder = isDir(abs);
+    let added = 0;
+    let removed = 0;
+    let changed = 0;
+    let reason = "";
+    if (isFolder) {
+      const files = listFiles(abs);
+      const hash2 = folderHash(files);
+      const previous = Number(scope.files ?? 0);
+      if (hash2 === lastSeenHash && files.length === previous) continue;
+      const delta = files.length - previous;
+      added = Math.max(0, delta);
+      removed = Math.max(0, -delta);
+      reason = `folder contents changed since last seed (files ${previous} -> ${files.length})`;
+    } else if (isFile(abs)) {
+      const text = readFileSync(abs, "utf8");
+      const hash2 = contentHash(text);
+      const currentLines = text.split(/\r?\n/).filter((line) => line.trim() !== "").map((line) => contentHash(line));
+      const diff = compareLineHashes(storedLines, currentLines);
+      if (hash2 === lastSeenHash && diff.added === 0 && diff.removed === 0 && diff.changed === 0) continue;
+      added = diff.added;
+      removed = diff.removed;
+      changed = diff.changed;
+      reason = `file content changed since last seed (+${added}/-${removed}/~${changed})`;
+    } else {
+      const previous = storedLines.length || Number(scope.files ?? 0);
+      removed = previous;
+      reason = `seed scope path is missing (${path})`;
+    }
+    const ref = normalizedRef(root, path);
+    const agentAttributed = events.some((event) => {
+      if (!event.ref || seededAt && event.created_at <= seededAt) return false;
+      const eventRef = normalizedRef(root, event.ref);
+      return eventRef === ref || isFolder && eventRef.startsWith(`${ref.replace(/\/$/, "")}/`);
+    });
+    out.push({ path, added, removed, changed, reason, agentAttributed });
+  }
+  return out;
+}
+function noteToolFileChange(db, sessionID, file2, summary) {
+  db.prepare(
+    "INSERT INTO change_events (created_at, session_id, source, summary, ref) VALUES (?, ?, 'agent-tool', ?, ?)"
+  ).run(nowISO(), sessionID, summary, file2);
+}
+function inspectRemovals(db, root) {
+  const rows = db.prepare(
+    `SELECT d.fact_id, d.file, d.line_hash, d.owner, m.content, m.kind, m.rank
+       FROM doc_manifest d JOIN memories m ON m.id = d.fact_id
+       WHERE m.obsolete_at IS NOT NULL AND d.owner = 'plugin'`
+  ).all();
+  const out = [];
+  for (const row of rows) {
+    const file2 = String(row.file);
+    const abs = resolvePath(root, file2);
+    if (!isFile(abs)) continue;
+    const expected = renderBullet(String(row.content), row.kind, row.rank);
+    const lines = readFileSync(abs, "utf8").replace(/\r\n/g, "\n").split("\n");
+    const line = lines.find((candidate) => candidate === expected && contentHash(candidate) === row.line_hash);
+    out.push({ factId: Number(row.fact_id), file: file2, line: line ?? null });
+  }
+  return out;
+}
+function selectedProposals(db, ids) {
+  const proposals = listDocUpdates(db);
+  if (!ids) return proposals;
+  const wanted = new Set(ids);
+  return proposals.filter((p) => wanted.has(p.id));
+}
+function buildPlan(db, root, ids) {
+  const proposals = selectedProposals(db, ids);
+  const byFile = /* @__PURE__ */ new Map();
+  for (const proposal of proposals) byFile.set(proposal.file, (byFile.get(proposal.file) ?? 0) + 1);
+  return {
+    proposals,
+    drift: scanDrift(db, root),
+    writes: [...byFile].map(([file2, added]) => ({ file: file2, added })),
+    removals: inspectRemovals(db, root).filter((r) => r.line !== null).map((r) => ({ file: r.file, content: r.line }))
+  };
+}
+function planDocs(db, root) {
+  return buildPlan(db, root);
+}
+function appendBullet(root, rel, heading, bullet) {
+  const abs = resolvePath(root, rel);
+  mkdirSync2(dirname2(abs), { recursive: true });
+  const text = isFile(abs) ? readFileSync(abs, "utf8") : "";
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  if (lines.includes(bullet)) return;
+  if (text === "") {
+    writeFileSync(abs, [`# ${fileTitle(rel)}`, "", `## ${heading}`, "", bullet, ""].join("\n"));
+    return;
+  }
+  const wanted = stripMarkdown(heading).toLowerCase();
+  let sectionStart = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(/^##\s+(.+?)\s*$/);
+    if (match && stripMarkdown(match[1]).toLowerCase() === wanted) {
+      sectionStart = i;
+      break;
+    }
+  }
+  if (sectionStart >= 0) {
+    let insertAt = lines.length;
+    for (let i = sectionStart + 1; i < lines.length; i++) {
+      if (/^#{1,6}\s+/.test(lines[i])) {
+        insertAt = i;
+        break;
+      }
+    }
+    lines.splice(insertAt, 0, bullet);
+  } else {
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    lines.push("", `## ${heading}`, "", bullet, "");
+  }
+  writeFileSync(abs, lines.join("\n"));
+}
+function applyRemovals(db, root, targets) {
+  const byFile = /* @__PURE__ */ new Map();
+  for (const target of targets) {
+    if (!byFile.has(target.file)) byFile.set(target.file, []);
+    byFile.get(target.file).push(target);
+  }
+  let removed = 0;
+  for (const [file2, entries] of byFile) {
+    const abs = resolvePath(root, file2);
+    if (!isFile(abs)) continue;
+    const lines = readFileSync(abs, "utf8").replace(/\r\n/g, "\n").split("\n");
+    const taken = /* @__PURE__ */ new Set();
+    for (const entry of entries) {
+      if (!entry.line) continue;
+      const idx = lines.findIndex((line, i) => !taken.has(i) && line === entry.line);
+      if (idx >= 0) {
+        taken.add(idx);
+        removed++;
+      }
+    }
+    writeFileSync(abs, lines.filter((_line, i) => !taken.has(i)).join("\n"));
+  }
+  for (const entry of targets) {
+    if (entry.line) db.prepare("DELETE FROM doc_manifest WHERE fact_id = ?").run(entry.factId);
+  }
+  return removed;
+}
+function applyDocs(db, root, ids) {
+  const plan = buildPlan(db, root, ids);
+  for (const proposal of plan.proposals) {
+    const fact = getFact(db, proposal.factId);
+    if (fact?.obsolete_at) {
+      db.prepare("UPDATE pending_doc_updates SET status = 'applied' WHERE id = ?").run(proposal.id);
+      continue;
+    }
+    const kind = fact?.kind ?? kindFromFile(proposal.file);
+    if (isManagedKind(kind) && !getTarget(db, kind).enabled) continue;
+    const bullet = renderBullet(proposal.content, kind, fact?.rank);
+    const heading = proposal.heading || kindTitle(kind);
+    appendBullet(root, proposal.file, heading, bullet);
+    db.prepare(
+      `INSERT INTO doc_manifest (fact_id, file, heading, line_hash, owner, origin, updated_at)
+       VALUES (?, ?, ?, ?, 'plugin', ?, ?)
+       ON CONFLICT(fact_id) DO UPDATE SET
+         file = excluded.file, heading = excluded.heading, line_hash = excluded.line_hash,
+         owner = 'plugin', origin = excluded.origin, updated_at = excluded.updated_at`
+    ).run(proposal.factId, proposal.file, heading, contentHash(bullet), fact?.origin ?? null, nowISO());
+    db.prepare("UPDATE pending_doc_updates SET status = 'applied' WHERE id = ?").run(proposal.id);
+  }
+  const targets = inspectRemovals(db, root);
+  applyRemovals(
+    db,
+    root,
+    targets.filter((t) => t.line !== null)
+  );
+  for (const target of targets) {
+    if (target.line) continue;
+    const abs = resolvePath(root, target.file);
+    if (isFile(abs)) {
+      db.prepare("UPDATE doc_manifest SET owner = 'user', updated_at = ? WHERE fact_id = ?").run(nowISO(), target.factId);
+    }
+  }
+  return plan;
+}
+
+// src/seed.ts
+import { lstatSync, readdirSync as readdirSync2, readFileSync as readFileSync2 } from "node:fs";
+import { basename as basename2, extname, isAbsolute as isAbsolute2, join as join2, relative, resolve, sep } from "node:path";
+var DEFAULT_SEED_CAPS = { files: 200, bytes: 1048576, depth: 8 };
+var SKIP_DIRS = /* @__PURE__ */ new Set([".git", "node_modules", ".opencode"]);
+var SUPPORTED_EXTENSIONS = /* @__PURE__ */ new Set([".md", ".markdown", ".txt", ".rst"]);
+function errorMessage(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+function slab(path, valid) {
+  return {
+    path,
+    isDir: false,
+    files: [],
+    skipped: 0,
+    errors: [],
+    fileHash: "",
+    lineHashes: [],
+    size: 0,
+    mtimeMs: 0,
+    valid
+  };
+}
+function normalizeRelPath(input) {
+  if (typeof input !== "string" || input.includes("\0")) {
+    return { ok: false, value: input, error: "invalid path" };
+  }
+  const trimmed = input.trim();
+  if (!trimmed) return { ok: false, value: input, error: "empty path" };
+  if (isAbsolute2(trimmed) || /^[A-Za-z]:[\\/]/.test(trimmed)) {
+    return { ok: false, value: input, error: "absolute paths are not allowed" };
+  }
+  let value = trimmed.replaceAll("\\", "/").replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+  if (value === "") value = ".";
+  if (value.split("/").includes("..")) {
+    return { ok: false, value, error: "path escapes root" };
+  }
+  return { ok: true, value };
+}
+function resolveTarget(root, rel) {
+  const rootAbs = resolve(root);
+  const abs = resolve(rootAbs, rel === "." ? "." : rel);
+  const check2 = relative(rootAbs, abs);
+  if (check2 === ".." || check2.startsWith(`..${sep}`) || isAbsolute2(check2)) {
+    return { ok: false, abs, error: "path escapes root" };
+  }
+  return { ok: true, abs };
+}
+function slugify(text) {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "") || "notes";
+}
+var MARKERS = [
+  { re: /^\[decision\]/i, kind: "decision", rank: "high" },
+  { re: /^decision\s*:/i, kind: "decision", rank: "high" },
+  { re: /^\[gotcha\]/i, kind: "gotcha", rank: "high" },
+  { re: /^gotcha\s*:/i, kind: "gotcha", rank: "high" },
+  { re: /^pitfall\s*:/i, kind: "gotcha", rank: "high" },
+  { re: /^\[debt\]/i, kind: "debt", rank: "medium" },
+  { re: /^debt\s*:/i, kind: "debt", rank: "medium" },
+  { re: /^\[reminder\]/i, kind: "reminder", rank: "medium" },
+  { re: /^reminder\s*:/i, kind: "reminder", rank: "medium" },
+  { re: /^todo\s*:/i, kind: "reminder", rank: "medium" },
+  { re: /^open\s+question\s*:/i, kind: "reminder", rank: "medium" }
+];
+var HEURISTICS = [
+  {
+    re: /\bdecided\b|\bwe(?:'ll| will)\s+use\b|\bswitch to\b/i,
+    kind: "decision",
+    rank: "high",
+    label: "decision keywords"
+  },
+  {
+    re: /\berror\b|\bfailed\b|\bpitfall\b|\bwatch out\b/i,
+    kind: "gotcha",
+    rank: "high",
+    label: "gotcha keywords"
+  },
+  {
+    re: /\brefactor\b|\bknown issue\b|\bworkaround\b|technical debt\b/i,
+    kind: "debt",
+    rank: "medium",
+    label: "debt keywords"
+  },
+  {
+    re: /\bneed to\b|\bfollow up\b|\blater\b|\binvestigate\b|\bquestion\b|\bplan\b/i,
+    kind: "reminder",
+    rank: "medium",
+    label: "reminder keywords"
+  }
+];
+function classify(content) {
+  for (const m of MARKERS) {
+    if (m.re.test(content)) return { kind: m.kind, rank: m.rank };
+  }
+  for (const h of HEURISTICS) {
+    if (h.re.test(content)) return { kind: h.kind, rank: h.rank, reason: `keyword: ${h.label}` };
+  }
+  return { kind: "reminder", rank: "medium", reason: "fallback: reminder/medium" };
+}
+function walkFolder(absDir, relDir, depth, caps, files, errors, skipped) {
+  let entries;
+  try {
+    entries = readdirSync2(absDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  } catch (err) {
+    errors.push(`${relDir || "."}: ${errorMessage(err)}`);
+    return;
+  }
+  const skip = (rel, reason) => {
+    skipped.count++;
+    errors.push(`${rel}: skipped (${reason})`);
+  };
+  for (const entry of entries) {
+    const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+    const abs = join2(absDir, entry.name);
+    if (entry.isSymbolicLink()) {
+      skip(rel, "symlink");
+      continue;
+    }
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) {
+        skip(rel, "excluded directory");
+        continue;
+      }
+      if (depth + 1 > caps.depth) {
+        skip(rel, "depth cap");
+        continue;
+      }
+      walkFolder(abs, rel, depth + 1, caps, files, errors, skipped);
+      continue;
+    }
+    if (!entry.isFile()) {
+      skip(rel, "unsupported file type");
+      continue;
+    }
+    if (!SUPPORTED_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
+      skip(rel, "unsupported extension");
+      continue;
+    }
+    if (depth + 1 > caps.depth) {
+      skip(rel, "depth cap");
+      continue;
+    }
+    let st;
+    try {
+      st = lstatSync(abs);
+    } catch (err) {
+      skip(rel, `unreadable (${errorMessage(err)})`);
+      continue;
+    }
+    if (st.size > caps.bytes) {
+      skip(rel, `file exceeds ${caps.bytes} byte cap`);
+      continue;
+    }
+    if (files.length >= caps.files) {
+      skip(rel, `file cap of ${caps.files} reached`);
+      continue;
+    }
+    let text;
+    try {
+      text = readFileSync2(abs, "utf8");
+    } catch (err) {
+      skip(rel, `unreadable (${errorMessage(err)})`);
+      continue;
+    }
+    if (text.includes("\0")) {
+      skip(rel, "binary content");
+      continue;
+    }
+    files.push({ abs, rel, text, size: st.size, mtimeMs: st.mtimeMs });
+  }
+}
+function scanPath(root, relPath, caps) {
+  const norm = normalizeRelPath(relPath);
+  const result = slab(norm.value, false);
+  if (!norm.ok) {
+    result.errors.push(norm.error ?? "invalid path");
+    return result;
+  }
+  const target = resolveTarget(root, norm.value);
+  if (!target.ok) {
+    result.errors.push(target.error ?? "path escapes root");
+    return result;
+  }
+  let st;
+  try {
+    st = lstatSync(target.abs);
+  } catch (err) {
+    result.errors.push(`${norm.value}: ${errorMessage(err)}`);
+    return result;
+  }
+  if (st.isSymbolicLink()) {
+    result.skipped = 1;
+    result.errors.push(`${norm.value}: skipped (symlink)`);
+    return result;
+  }
+  result.valid = true;
+  if (st.isFile()) {
+    try {
+      const text = readFileSync2(target.abs, "utf8");
+      result.files.push({ abs: target.abs, rel: norm.value, text, size: st.size, mtimeMs: st.mtimeMs });
+    } catch (err) {
+      result.valid = false;
+      result.errors.push(`${norm.value}: ${errorMessage(err)}`);
+    }
+  } else if (st.isDirectory()) {
+    result.isDir = true;
+    const skipped = { count: 0 };
+    walkFolder(target.abs, norm.value === "." ? "" : norm.value, 0, caps, result.files, result.errors, skipped);
+    result.skipped = skipped.count;
+  } else {
+    result.valid = false;
+    result.errors.push(`${norm.value}: unsupported file type`);
+  }
+  if (!result.valid) return result;
+  const lineHashes = [];
+  for (const file2 of result.files) {
+    for (const raw of file2.text.split(/\r?\n/)) {
+      const line = stripMarkdown(raw.trim()).replace(/\s+/g, " ").trim();
+      if (!line || /^(```|~~~)/.test(line)) continue;
+      lineHashes.push(contentHash(`${file2.rel}
+${line}`));
+    }
+    result.size += file2.size;
+    result.mtimeMs = Math.max(result.mtimeMs, file2.mtimeMs);
+  }
+  result.fileHash = contentHash(result.files.map((f) => `${f.rel}\0${f.text}`).join("\n"));
+  result.lineHashes = lineHashes;
+  return result;
+}
+function parseBlocks(files) {
+  const blocks = [];
+  const reasons = /* @__PURE__ */ new Map();
+  const headingRe = /^#{1,6}\s+(.+)$/;
+  const bulletRe = /^(?:[-*+]|\d+[.)])\s+(.+)$/;
+  const fenceRe = /^(```|~~~)/;
+  for (const file2 of files) {
+    const lines = file2.text.split(/\r?\n/);
+    const stem = basename2(file2.rel, extname(file2.rel));
+    let heading = "";
+    let contextDate = null;
+    let counter = 0;
+    let inFence = false;
+    const push = (rawContent, line) => {
+      const content = stripMarkdown(rawContent).replace(/\s+/g, " ").trim();
+      if (content.length < 25) return;
+      counter++;
+      const cls = classify(content);
+      const block = {
+        content,
+        heading,
+        anchor: `${slugify(heading || stem)}-${counter}`,
+        kind: cls.kind,
+        rank: cls.rank,
+        keywords: keywordsFrom(content, [stem, ...tokenize(heading).slice(0, 3)]),
+        verified: parseVerifiedDate(content) ?? contextDate,
+        line,
+        file: file2.rel
+      };
+      blocks.push(block);
+      reasons.set(block, cls.reason);
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i];
+      const trimmed = raw.trim();
+      if (fenceRe.test(trimmed)) {
+        inFence = !inFence;
+        continue;
+      }
+      if (inFence) continue;
+      const seenDate = parseVerifiedDate(trimmed);
+      if (seenDate) contextDate = seenDate;
+      const headingMatch = trimmed.match(headingRe);
+      if (headingMatch) {
+        heading = stripMarkdown(headingMatch[1]).replace(/\s+/g, " ").trim();
+        continue;
+      }
+      if (trimmed.startsWith("|")) continue;
+      if (trimmed === "") continue;
+      const bulletMatch = trimmed.match(bulletRe);
+      if (bulletMatch) {
+        let text2 = bulletMatch[1];
+        let j2 = i + 1;
+        while (j2 < lines.length) {
+          const next = lines[j2];
+          const nextTrimmed = next.trim();
+          if (!nextTrimmed || !/^\s/.test(next)) break;
+          if (fenceRe.test(nextTrimmed) || bulletRe.test(nextTrimmed) || headingRe.test(nextTrimmed) || nextTrimmed.startsWith("|"))
+            break;
+          const contDate = parseVerifiedDate(nextTrimmed);
+          if (contDate) contextDate = contDate;
+          text2 += ` ${nextTrimmed}`;
+          j2++;
+        }
+        push(text2, i + 1);
+        i = j2 - 1;
+        continue;
+      }
+      let text = trimmed;
+      let j = i + 1;
+      while (j < lines.length) {
+        const next = lines[j];
+        const nextTrimmed = next.trim();
+        if (!nextTrimmed || fenceRe.test(nextTrimmed) || headingRe.test(nextTrimmed) || bulletRe.test(nextTrimmed) || nextTrimmed.startsWith("|"))
+          break;
+        const contDate = parseVerifiedDate(nextTrimmed);
+        if (contDate) contextDate = contDate;
+        text += ` ${nextTrimmed}`;
+        j++;
+      }
+      push(text, i + 1);
+      i = j - 1;
+    }
+  }
+  return { blocks, reasons };
+}
+function toFact(r) {
+  return {
+    id: r.id,
+    content: r.content,
+    content_hash: r.content_hash,
+    keywords: r.keywords ?? "",
+    kind: r.kind,
+    rank: r.rank,
+    weight: r.weight,
+    accesses: r.accesses,
+    source: r.source,
+    origin: r.origin ?? null,
+    scope: r.scope ?? null,
+    obsolete_at: r.obsolete_at ?? null,
+    last_verified_at: r.last_verified_at ?? null,
+    created_at: r.created_at,
+    last_accessed_at: r.last_accessed_at ?? null
+  };
+}
+function originInScope(origin, scope) {
+  if (!origin) return false;
+  const value = origin.replaceAll("\\", "/");
+  return value === scope || value.startsWith(`${scope}/`) || value.startsWith(`${scope}#`);
+}
+function rowInScope(row, scope) {
+  if (row.source !== "seed") return false;
+  if (row.scope) return row.scope === scope;
+  return originInScope(row.origin, scope);
+}
+function loadScopeData(db, scope) {
+  const all = db.prepare("SELECT * FROM memories").all().map(toFact);
+  const inScope = all.filter((r) => rowInScope(r, scope)).sort((a, b) => a.id - b.id);
+  const inScopeIds = new Set(inScope.map((r) => r.id));
+  const external = all.filter((r) => !inScopeIds.has(r.id));
+  const hashToRow = /* @__PURE__ */ new Map();
+  for (const r of inScope) if (!hashToRow.has(r.content_hash)) hashToRow.set(r.content_hash, r);
+  return { inScope, external, hashToRow };
+}
+function blockFromRow(row) {
+  const origin = row.origin ?? "";
+  const hashAt = origin.indexOf("#");
+  return {
+    content: row.content,
+    heading: "",
+    anchor: hashAt >= 0 ? origin.slice(hashAt + 1) : "",
+    kind: row.kind,
+    rank: row.rank,
+    keywords: row.keywords ? row.keywords.split(",").map((k) => k.trim()).filter(Boolean) : [],
+    verified: row.last_verified_at,
+    line: 0,
+    file: hashAt >= 0 ? origin.slice(0, hashAt) : origin
+  };
+}
+function mergeDuplicate(db, owner, drop) {
+  const rank = RANK_ORDER[owner.rank] >= RANK_ORDER[drop.rank] ? owner.rank : drop.rank;
   const accesses = owner.accesses + drop.accesses;
-  const rank = RANK_ORDER[drop.rank] > RANK_ORDER[owner.rank] ? drop.rank : owner.rank;
-  db.prepare("UPDATE memories SET accesses = ?, rank = ?, weight = ? WHERE id = ?").run(
-    accesses,
+  db.prepare("UPDATE memories SET rank = ?, accesses = ?, weight = ? WHERE id = ?").run(
     rank,
+    accesses,
     computeWeight(rank, accesses, 0),
     owner.id
   );
-  db.prepare("DELETE FROM memories WHERE id = ?").run(dropId);
+  db.prepare("DELETE FROM memories WHERE id = ?").run(drop.id);
 }
-function reSeedFromDocs(db, root, apply = false) {
-  const files = discoverDocFiles(root, listTargets(db));
-  const docFacts = [];
-  for (const f of files) docFacts.push(...parseDocFile(f.abs, f.rel, f.override));
-  const report = {
-    apply,
-    files: files.length,
-    docFacts: docFacts.length,
-    inserted: 0,
-    updatedContent: 0,
-    rebound: 0,
-    demoted: 0,
-    unchanged: 0,
-    merged: 0,
-    missingFromDocs: []
+function computeChanges(db, parsed, scope, data, apply) {
+  const changes = [];
+  const externalHashes = new Set(data.external.map((r) => r.content_hash));
+  const externalOrigins = new Set(data.external.map((r) => r.origin).filter((o) => !!o));
+  const blockHash = /* @__PURE__ */ new Map();
+  const blocksByHash = /* @__PURE__ */ new Map();
+  const blockByOrigin = /* @__PURE__ */ new Map();
+  for (const block of parsed.blocks) {
+    const hash2 = contentHash(block.content);
+    const origin = `${block.file}#${block.anchor}`;
+    blockHash.set(block, hash2);
+    const sameHash = blocksByHash.get(hash2) ?? [];
+    sameHash.push(block);
+    blocksByHash.set(hash2, sameHash);
+    if (!blockByOrigin.has(origin)) blockByOrigin.set(origin, block);
+  }
+  const claimed = /* @__PURE__ */ new Set();
+  const claimedHashes = /* @__PURE__ */ new Set();
+  const matchedRows = /* @__PURE__ */ new Set();
+  const addChange = (block, status, id, reason) => {
+    const change = { block, status };
+    if (id !== void 0) change.id = id;
+    const finalReason = reason ?? parsed.reasons.get(block);
+    if (finalReason) change.reason = finalReason;
+    changes.push(change);
+    return change;
   };
-  const docByHash = /* @__PURE__ */ new Map();
-  for (const d of docFacts) if (!docByHash.has(d.hash)) docByHash.set(d.hash, d);
-  const docByOrigin = /* @__PURE__ */ new Map();
-  for (const d of docFacts) if (!docByOrigin.has(d.origin)) docByOrigin.set(d.origin, d);
-  const matched = /* @__PURE__ */ new Set();
-  const claimedOrigins = /* @__PURE__ */ new Set();
-  const seedRows = db.prepare("SELECT * FROM memories WHERE source = 'seed'").all();
-  const plan = () => {
-    const pending = [];
-    for (const r of seedRows) {
-      const row = r;
-      const byHash = docByHash.get(row.content_hash);
-      if (!byHash) {
-        pending.push(row);
-        continue;
-      }
-      matched.add(byHash.hash);
-      claimedOrigins.add(byHash.origin);
-      if (byHash.origin !== row.origin) {
-        report.rebound++;
-        if (apply) {
-          db.prepare("UPDATE memories SET origin = ?, last_verified_at = ? WHERE id = ?").run(byHash.origin, todayISO(), row.id);
-        }
-      } else {
-        report.unchanged++;
-        if (apply) db.prepare("UPDATE memories SET origin = ? WHERE id = ?").run(byHash.origin, row.id);
-      }
-    }
-    for (const row of pending) {
-      const byOrigin = docByOrigin.get(row.origin ?? "");
-      if (byOrigin) {
-        if (matched.has(byOrigin.hash)) {
-          report.merged++;
-          if (apply) mergeDuplicate(db, byOrigin.hash, row.id);
-          continue;
-        }
-        matched.add(byOrigin.hash);
-        claimedOrigins.add(byOrigin.origin);
-        report.updatedContent++;
-        if (apply) {
-          db.prepare(
-            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, origin = ?, last_verified_at = ? WHERE id = ?"
-          ).run(byOrigin.content, byOrigin.hash, byOrigin.keywords.join(","), byOrigin.origin, byOrigin.verified ?? todayISO(), row.id);
-        }
-        continue;
-      }
-      const rowTokens = new Set(tokenize(row.content));
-      let best = null;
-      let bestScore = 0;
-      for (const d of docFacts) {
-        if (matched.has(d.hash) || d.kind !== row.kind || claimedOrigins.has(d.origin)) continue;
-        const score = similarityScore(rowTokens, new Set(tokenize(d.content)));
-        if (score > bestScore) {
-          bestScore = score;
-          best = d;
-        }
-      }
-      if (best && bestScore >= 0.75) {
-        matched.add(best.hash);
-        claimedOrigins.add(best.origin);
-        report.rebound++;
-        if (apply) {
-          db.prepare(
-            "UPDATE memories SET content = ?, content_hash = ?, keywords = ?, origin = ?, last_verified_at = ? WHERE id = ?"
-          ).run(best.content, best.hash, best.keywords.join(","), best.origin, best.verified ?? todayISO(), row.id);
-        }
-        continue;
-      }
-      if (row.rank === "low") {
-        report.unchanged++;
-        if (apply) db.prepare("UPDATE memories SET origin = ? WHERE id = ?").run(row.origin, row.id);
-      } else {
-        report.demoted++;
-        if (apply) db.prepare("UPDATE memories SET rank = 'low', weight = 0.6, origin = ? WHERE id = ?").run(row.origin, row.id);
-      }
-    }
-    for (const d of docFacts) {
-      if (matched.has(d.hash)) continue;
-      matched.add(d.hash);
-      if (db.prepare("SELECT 1 FROM memories WHERE content_hash = ?").get(d.hash)) continue;
-      if (db.prepare("SELECT 1 FROM memories WHERE source = 'seed' AND origin = ?").get(d.origin)) continue;
-      report.inserted++;
+  const claim = (block) => {
+    claimed.add(block);
+    claimedHashes.add(blockHash.get(block) ?? "");
+  };
+  const originOf = (block) => `${block.file}#${block.anchor}`;
+  const writeContent = (row, block, hash2) => {
+    if (!apply) return;
+    db.prepare(
+      `UPDATE memories
+         SET content = ?, content_hash = ?, keywords = ?, kind = ?, rank = ?, weight = ?,
+             scope = ?, origin = ?, last_verified_at = ?
+       WHERE id = ?`
+    ).run(
+      block.content,
+      hash2,
+      block.keywords.join(","),
+      block.kind,
+      block.rank,
+      computeWeight(block.rank, row.accesses, 0),
+      scope,
+      originOf(block),
+      block.verified ?? row.last_verified_at,
+      row.id
+    );
+  };
+  const writeOriginOnly = (row, block) => {
+    if (!apply) return;
+    db.prepare("UPDATE memories SET scope = ?, origin = ?, last_verified_at = ? WHERE id = ?").run(
+      scope,
+      originOf(block),
+      block.verified ?? row.last_verified_at,
+      row.id
+    );
+  };
+  const restoreRow = (row) => {
+    if (!apply) return;
+    db.prepare("UPDATE memories SET scope = ?, origin = ? WHERE id = ?").run(scope, row.origin, row.id);
+  };
+  const demoteRow = (row) => {
+    if (!apply) return;
+    db.prepare("UPDATE memories SET rank = 'low', weight = ?, scope = ?, origin = ? WHERE id = ?").run(
+      computeWeight("low", row.accesses, 0),
+      scope,
+      row.origin,
+      row.id
+    );
+  };
+  for (const row of data.inScope) {
+    const allWithHash = blocksByHash.get(row.content_hash) ?? [];
+    if (allWithHash.length === 0) continue;
+    const candidates = allWithHash.filter((b) => !claimed.has(b));
+    if (candidates.length === 0) {
+      const block2 = allWithHash[0];
+      addChange(block2, "merged", row.id, "duplicate content");
       if (apply) {
-        addFact(db, {
-          content: d.content,
-          keywords: d.keywords,
-          kind: d.kind,
-          rank: d.rank,
-          source: "seed",
-          origin: d.origin,
-          verified: d.verified ?? void 0,
-          exact: true
-        });
+        const owner = data.hashToRow.get(row.content_hash);
+        if (owner && owner.id !== row.id) mergeDuplicate(db, owner, row);
+      }
+      matchedRows.add(row.id);
+      continue;
+    }
+    const block = candidates.find((b) => originOf(b) === row.origin) ?? candidates[0];
+    claim(block);
+    matchedRows.add(row.id);
+    if (originOf(block) === row.origin) {
+      addChange(block, "unchanged", row.id);
+      writeOriginOnly(row, block);
+    } else {
+      addChange(block, "rebound", row.id);
+      writeContent(row, block, blockHash.get(block) ?? "");
+    }
+  }
+  for (const row of data.inScope) {
+    if (matchedRows.has(row.id)) continue;
+    const byOrigin = blockByOrigin.get(row.origin ?? "");
+    if (byOrigin && !claimed.has(byOrigin)) {
+      const hash2 = blockHash.get(byOrigin) ?? "";
+      if (externalHashes.has(hash2) || claimedHashes.has(hash2)) {
+        addChange(byOrigin, "skipped", row.id, "content hash owned by another row");
+        restoreRow(row);
+        matchedRows.add(row.id);
+        continue;
+      }
+      claim(byOrigin);
+      matchedRows.add(row.id);
+      addChange(byOrigin, "updated-content", row.id);
+      writeContent(row, byOrigin, hash2);
+      continue;
+    }
+    const rowTokens = tokenSet(row.content);
+    let best = null;
+    let bestScore = 0;
+    for (const block of parsed.blocks) {
+      if (claimed.has(block) || block.kind !== row.kind) continue;
+      const hash2 = blockHash.get(block) ?? "";
+      if (externalHashes.has(hash2) || claimedHashes.has(hash2)) continue;
+      if (externalOrigins.has(originOf(block))) continue;
+      const score = similarityScore(rowTokens, tokenSet(block.content));
+      if (score > bestScore) {
+        bestScore = score;
+        best = block;
       }
     }
+    if (best && bestScore >= 0.75) {
+      claim(best);
+      matchedRows.add(row.id);
+      addChange(best, "rebound", row.id);
+      writeContent(row, best, blockHash.get(best) ?? "");
+      continue;
+    }
+    const synthetic = blockFromRow(row);
+    if (row.rank === "low") {
+      addChange(synthetic, "unchanged", row.id, "already low");
+      restoreRow(row);
+    } else {
+      addChange(synthetic, "demoted", row.id, "no longer present in source");
+      demoteRow(row);
+    }
+  }
+  for (const block of parsed.blocks) {
+    if (claimed.has(block)) continue;
+    const hash2 = blockHash.get(block) ?? "";
+    if (claimedHashes.has(hash2)) {
+      addChange(block, "skipped", void 0, "duplicate content");
+      continue;
+    }
+    if (externalHashes.has(hash2)) {
+      addChange(block, "skipped", void 0, "content hash owned by another scope");
+      continue;
+    }
+    if (externalOrigins.has(originOf(block))) {
+      addChange(block, "skipped", void 0, "origin owned by another scope");
+      continue;
+    }
+    let id;
+    if (apply) {
+      const res = addFact(db, {
+        content: block.content,
+        keywords: block.keywords,
+        kind: block.kind,
+        rank: block.rank,
+        source: "seed",
+        origin: originOf(block),
+        scope,
+        verified: block.verified ?? void 0,
+        exact: true
+      });
+      id = res.id;
+    }
+    claim(block);
+    addChange(block, "inserted", id);
+  }
+  return changes;
+}
+function upsertScope(db, scan) {
+  const now = nowISO();
+  db.prepare(
+    `INSERT INTO seed_scopes
+       (path, kind, last_seen_hash, last_seeded_hash, size, mtime_ms, files, skipped, line_hashes, last_seeded_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(path) DO UPDATE SET
+       kind = excluded.kind,
+       last_seen_hash = excluded.last_seen_hash,
+       last_seeded_hash = excluded.last_seeded_hash,
+       size = excluded.size,
+       mtime_ms = excluded.mtime_ms,
+       files = excluded.files,
+       skipped = excluded.skipped,
+       line_hashes = excluded.line_hashes,
+       last_seeded_at = excluded.last_seeded_at`
+  ).run(
+    scan.path,
+    scan.isDir ? "dir" : "file",
+    scan.fileHash,
+    scan.fileHash,
+    scan.size,
+    Math.round(scan.mtimeMs),
+    scan.files.length,
+    scan.skipped,
+    JSON.stringify(scan.lineHashes),
+    now,
+    now
+  );
+}
+function makePlan(scan, blocks, changes) {
+  return {
+    path: scan.path,
+    isDir: scan.isDir,
+    files: scan.files.length,
+    skipped: scan.skipped,
+    blocks,
+    changes,
+    fileHash: scan.fileHash,
+    errors: scan.errors
   };
-  if (apply) {
-    db.exec("BEGIN");
-    try {
-      db.exec("UPDATE memories SET origin = NULL WHERE source = 'seed'");
-      plan();
-      db.exec("COMMIT");
-    } catch (e) {
-      db.exec("ROLLBACK");
-      throw e;
+}
+function planSeed(db, root, relPath, caps = DEFAULT_SEED_CAPS) {
+  const scan = scanPath(root, relPath, caps);
+  if (!scan.valid) return makePlan(scan, [], []);
+  const parsed = parseBlocks(scan.files);
+  const scope = scan.path;
+  const changes = computeChanges(db, parsed, scope, loadScopeData(db, scope), false);
+  return makePlan(scan, parsed.blocks, changes);
+}
+function applySeed(db, root, relPath, caps = DEFAULT_SEED_CAPS) {
+  const scan = scanPath(root, relPath, caps);
+  if (!scan.valid) return makePlan(scan, [], []);
+  const parsed = parseBlocks(scan.files);
+  const scope = scan.path;
+  const data = loadScopeData(db, scope);
+  let changes = [];
+  db.exec("BEGIN");
+  try {
+    for (const row of data.inScope) {
+      db.prepare("UPDATE memories SET origin = NULL WHERE id = ?").run(row.id);
+    }
+    changes = computeChanges(db, parsed, scope, data, true);
+    upsertScope(db, scan);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return makePlan(scan, parsed.blocks, changes);
+}
+function parseLineHashes2(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+function lineDiff(stored, current) {
+  const remaining = /* @__PURE__ */ new Map();
+  for (const hash2 of stored) remaining.set(hash2, (remaining.get(hash2) ?? 0) + 1);
+  let common = 0;
+  for (const hash2 of current) {
+    const left = remaining.get(hash2) ?? 0;
+    if (left > 0) {
+      remaining.set(hash2, left - 1);
+      common++;
+    }
+  }
+  const added = current.length - common;
+  const removed = stored.length - common;
+  return { added, removed, changed: Math.min(added, removed) };
+}
+function changedSeedScopes(db, root, force = false) {
+  const scopes = db.prepare("SELECT * FROM seed_scopes ORDER BY path").all();
+  const out = [];
+  for (const scope of scopes) {
+    const scan = scanPath(root, scope.path, DEFAULT_SEED_CAPS);
+    const diff = lineDiff(parseLineHashes2(scope.line_hashes), scan.lineHashes);
+    const hashChanged = scan.valid && scan.fileHash !== scope.last_seen_hash;
+    const hasLineChanges = diff.added > 0 || diff.removed > 0;
+    if (!force && scan.valid && !hashChanged && !hasLineChanges) continue;
+    let reason;
+    if (!scan.valid) {
+      reason = `unreadable: ${scan.errors.join("; ") || "missing"}`;
+    } else if (force && !hashChanged && !hasLineChanges) {
+      reason = "forced";
+    } else {
+      reason = hashChanged ? "hash changed" : "lines changed";
+      if (hasLineChanges || diff.changed > 0) {
+        reason += ` (added=${diff.added}, removed=${diff.removed}, changed=${diff.changed})`;
+      }
+    }
+    out.push({
+      path: scope.path,
+      reason,
+      added: scan.valid ? diff.added : 0,
+      removed: scan.valid ? diff.removed : 0,
+      changed: scan.valid ? diff.changed : 0
+    });
+  }
+  return out;
+}
+
+// src/changelog.ts
+import { execFileSync } from "node:child_process";
+import { mkdirSync as mkdirSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { join as join3 } from "node:path";
+var VERSION_RE = /^v?[0-9A-Za-z._-]{1,64}$/;
+var MAX_BULLETS = 30;
+var CHANGELOG_REL = "docs/hw-memory/changelog.md";
+var AI_PREFIX = "AI summarization requested; deterministic bullets below.";
+var GIT_ERROR_NOTE = "Git history is unavailable in this directory; no commits collected.";
+var noChangesNote = (label) => `No recorded changes since ${label}.`;
+function git(args, cwd) {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      timeout: 5e3,
+      stdio: ["ignore", "pipe", "ignore"]
+    });
+  } catch {
+    return null;
+  }
+}
+function resolveAnchor(db, root, version2, source = "auto") {
+  let normalized = null;
+  if (version2 !== void 0) {
+    if (typeof version2 !== "string" || !VERSION_RE.test(version2)) {
+      throw new Error(`Invalid version label: ${String(version2).slice(0, 80)}`);
+    }
+    normalized = version2.replace(/^v/, "");
+  }
+  if (normalized !== null) {
+    if (source !== "journal") {
+      for (const tag of [normalized, `v${normalized}`]) {
+        if (tag.startsWith("-")) continue;
+        const sha = git(["rev-parse", "--verify", `${tag}^{commit}`], root);
+        if (sha && /^[0-9a-f]{7,64}$/i.test(sha.trim())) {
+          return { label: normalized, commitSha: sha.trim(), journalSeq: null, source: "git" };
+        }
+      }
+    }
+    if (source !== "git") {
+      for (const label of [normalized, `v${normalized}`]) {
+        const row = db.prepare("SELECT commit_sha, journal_seq FROM version_checkpoints WHERE label = ?").get(label);
+        if (row) {
+          const commitSha = row.commit_sha ?? null;
+          const journalSeq = row.journal_seq ?? null;
+          return { label: normalized, commitSha, journalSeq, source: commitSha ? "git" : "journal" };
+        }
+      }
+    }
+    if (source === "git") return { label: normalized, commitSha: null, journalSeq: null, source: "none" };
+    const first = git(["rev-list", "--max-parents=0", "HEAD"], root);
+    if (first && first.trim()) {
+      return { label: normalized, commitSha: first.trim().split(/\s+/)[0], journalSeq: null, source: "git" };
+    }
+    return { label: normalized, commitSha: null, journalSeq: 0, source: "journal" };
+  }
+  if (source !== "journal") {
+    const first = git(["rev-list", "--max-parents=0", "HEAD"], root);
+    if (first && first.trim()) {
+      return { label: "beginning", commitSha: first.trim().split(/\s+/)[0], journalSeq: null, source: "git" };
+    }
+  }
+  if (source === "git") return { label: "beginning", commitSha: null, journalSeq: null, source: "none" };
+  return { label: "beginning", commitSha: null, journalSeq: 0, source: "journal" };
+}
+function readGitCommits(anchor, root) {
+  const range = anchor.commitSha ? `${anchor.commitSha}..HEAD` : "HEAD";
+  let out;
+  try {
+    out = execFileSync(
+      "git",
+      ["log", "--no-merges", "--date=short", "--pretty=format:%h%x1f%ad%x1f%s", range],
+      { cwd: root, encoding: "utf8", timeout: 5e3, stdio: ["ignore", "pipe", "ignore"] }
+    );
+  } catch {
+    return { commits: [], error: GIT_ERROR_NOTE };
+  }
+  const commits = [];
+  for (const line of out.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const parts = line.split("");
+    const hash2 = (parts[0] ?? "").trim();
+    const subject = parts.slice(2).join("").trim();
+    if (!hash2 || !subject) continue;
+    commits.push({ hash: hash2, subject });
+  }
+  return { commits, error: null };
+}
+function parseSubject(subject) {
+  const m = subject.match(/^([A-Za-z][\w-]*)(\(([^)]*)\))?!?:\s*(.+)$/);
+  if (!m) return { type: "", scope: "", text: subject.trim() };
+  return { type: m[1].toLowerCase(), scope: m[3] ?? "", text: m[4].trim() };
+}
+function nearDuplicate(a, b) {
+  const na = a.trim().toLowerCase().replace(/\s+/g, " ");
+  const nb = b.trim().toLowerCase().replace(/\s+/g, " ");
+  if (na === nb) return true;
+  const ta = tokenize(na);
+  const tb = tokenize(nb);
+  if (ta.length === 0 || tb.length === 0) return false;
+  const setB = new Set(tb);
+  const inter = ta.filter((t) => setB.has(t)).length;
+  const union2 = (/* @__PURE__ */ new Set([...ta, ...tb])).size;
+  const jaccard = union2 ? inter / union2 : 0;
+  const ratio = Math.min(ta.length, tb.length) / Math.max(ta.length, tb.length);
+  return jaccard >= 0.85 || inter === Math.min(ta.length, tb.length) && ratio >= 0.7;
+}
+function overflowBullet(beyond, noun) {
+  return `- \u2026 and ${beyond} more ${noun}`;
+}
+function formatGitBullets(commits) {
+  const ordered = [...commits].sort((a, b) => {
+    const ta = parseSubject(a.subject).type || "\uFFFF";
+    const tb = parseSubject(b.subject).type || "\uFFFF";
+    return ta.localeCompare(tb);
+  });
+  const seenHashes = /* @__PURE__ */ new Set();
+  const seenSubjects = [];
+  const kept = [];
+  for (const c of ordered) {
+    const key = contentHash(c.subject);
+    if (seenHashes.has(key)) continue;
+    if (seenSubjects.some((s) => nearDuplicate(s, c.subject))) continue;
+    seenHashes.add(key);
+    seenSubjects.push(c.subject);
+    kept.push(c);
+  }
+  const bullets = [];
+  for (const c of kept.slice(0, MAX_BULLETS)) {
+    const { type, scope, text } = parseSubject(c.subject);
+    const label = type ? `${type}${scope ? `(${scope})` : ""}: ${text}` : text;
+    bullets.push(`- ${label} (${c.hash})`);
+  }
+  const beyond = kept.length - MAX_BULLETS;
+  if (beyond > 0) bullets.push(overflowBullet(beyond, "commits"));
+  return bullets;
+}
+function formatJournalBullets(db, anchor) {
+  const rows = anchor.journalSeq === null || anchor.journalSeq === 0 ? db.prepare("SELECT summary FROM change_events ORDER BY seq ASC").all() : db.prepare("SELECT summary FROM change_events WHERE seq > ? ORDER BY seq ASC").all(anchor.journalSeq);
+  const seen = /* @__PURE__ */ new Set();
+  const kept = [];
+  for (const r of rows) {
+    const text = String(r.summary ?? "").trim().replace(/\s+/g, " ");
+    if (!text) continue;
+    const key = contentHash(text);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    kept.push(text);
+  }
+  if (kept.length === 0) return [`- ${noChangesNote(anchor.label)}`];
+  const bullets = kept.slice(0, MAX_BULLETS).map((text) => `- ${text}`);
+  const beyond = kept.length - MAX_BULLETS;
+  if (beyond > 0) bullets.push(overflowBullet(beyond, "changes"));
+  return bullets;
+}
+function collectChanges(db, root, version2, opts = {}) {
+  const anchor = resolveAnchor(db, root, version2, opts.source);
+  const source = anchor.source === "git" ? "git" : "journal";
+  let bullets = [];
+  let note = null;
+  if (source === "git") {
+    const result = readGitCommits(anchor, root);
+    note = result.error;
+    if (!result.error) bullets = formatGitBullets(result.commits);
+    if (!result.error && opts.uncommitted && opts.uncommitted.length > 0) {
+      bullets.push("", "## Uncommitted", "");
+      for (const line of opts.uncommitted) {
+        const text2 = String(line).trim().replace(/\s+/g, " ");
+        if (text2) bullets.push(`- ${text2}`);
+      }
     }
   } else {
-    plan();
+    bullets = formatJournalBullets(db, anchor);
   }
-  const crucial = db.prepare(
-    "SELECT id, kind, rank, content FROM memories WHERE source != 'seed' AND origin IS NULL AND (kind IN ('decision','gotcha','debt') OR rank IN ('critical','high'))"
-  ).all();
-  report.missingFromDocs = crucial.map((c) => ({ id: c.id, kind: c.kind, rank: c.rank, content: c.content }));
-  return report;
+  const isPlaceholder = bullets.length === 0 || bullets.length === 1 && bullets[0] === `- ${noChangesNote(anchor.label)}`;
+  const rendered = bullets.join("\n");
+  const text = [opts.summary === "ai" ? AI_PREFIX : null, note, rendered].filter((part) => part !== null && part !== "").join("\n");
+  let savedId = null;
+  if (opts.save !== false && !isPlaceholder) savedId = saveChangelogFact(db, anchor, bullets);
+  return {
+    text,
+    anchor,
+    source,
+    bullets,
+    count: bullets.filter((b) => b.startsWith("- ")).length,
+    savedId
+  };
 }
-function ensureDirFor(absPath) {
-  mkdirSync2(join(absPath, ".."), { recursive: true });
-}
-function normalizedLines(text) {
-  const norm = text.endsWith("\n") ? text : text + "\n";
-  return norm.split("\n");
-}
-function writeLines(absPath, lines) {
-  ensureDirFor(absPath);
-  writeFileSync(absPath, lines.join("\n"));
-}
-function writeDecision(root, rel, content, title) {
-  const abs = join(root, rel);
-  let text = "";
-  if (isFile(abs)) text = readFileSync(abs, "utf8");
-  let next = 1;
-  for (const m of text.matchAll(/^(\d+)[.)]\s+/gm)) next = Math.max(next, Number(m[1]) + 1);
-  const item = `${next}. **${title}**: ${content}`;
-  if (text === "") {
-    writeLines(abs, ["# Decisions", "", item, ""]);
-    return { written: true, origin: `${rel}#${next}`, file: rel };
+function saveChangelogFact(db, anchor, bullets) {
+  const content = bullets.join("\n").trim().slice(0, 4e3);
+  const id = addFact(db, {
+    content,
+    kind: "changelog",
+    rank: "medium",
+    source: "auto",
+    origin: `changes:${anchor.label}..HEAD`,
+    exact: true
+  }).id;
+  db.prepare("UPDATE memories SET content = ? WHERE id = ?").run(content, id);
+  if (anchor.label !== "beginning") {
+    const createdAt = (/* @__PURE__ */ new Date()).toISOString();
+    db.prepare(
+      `INSERT INTO version_checkpoints (label, commit_sha, journal_seq, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(label) DO UPDATE SET
+         commit_sha = excluded.commit_sha,
+         journal_seq = excluded.journal_seq,
+         created_at = excluded.created_at`
+    ).run(anchor.label, anchor.commitSha, anchor.journalSeq, createdAt);
   }
-  const lines = normalizedLines(text);
-  let insertAt = lines.length - 1;
-  for (let i = 0; i < lines.length; i++) {
-    if (/^##\s*(статус|status)\s*$/i.test(lines[i].trim())) {
-      insertAt = i;
-      break;
-    }
-  }
-  lines.splice(insertAt, 0, item);
-  writeLines(abs, lines);
-  return { written: true, origin: `${rel}#${next}`, file: rel };
+  return id;
 }
-function writeMonthlyFile(root, rel, header, bullet) {
-  const abs = join(root, rel);
-  const month = todayISO().slice(0, 7);
-  if (!isFile(abs)) {
-    writeLines(abs, [header, "", `## ${month}`, "", bullet, ""]);
-    return { written: true, origin: `${rel}#${month}`, file: rel };
+function labelFromOrigin(origin, createdAt) {
+  if (origin && origin.startsWith("changes:")) {
+    const rest = origin.slice("changes:".length);
+    if (rest.endsWith("..HEAD")) return rest.slice(0, -"..HEAD".length);
+    return rest;
   }
-  const lines = normalizedLines(readFileSync(abs, "utf8"));
-  let sectionStart = -1;
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].trim().match(/^##\s+(\d{4}-\d{2})\s*$/);
-    if (m) sectionStart = m[1] === month ? i : -1;
-  }
-  if (sectionStart === -1) {
-    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-    lines.push("", `## ${month}`, "", bullet, "");
-    writeLines(abs, lines);
-    return { written: true, origin: `${rel}#${month}`, file: rel };
-  }
-  let insertAt = lines.length - 1;
-  for (let i = sectionStart + 1; i < lines.length; i++) {
-    if (/^##\s+/.test(lines[i].trim())) {
-      insertAt = i;
-      break;
-    }
-  }
-  lines.splice(insertAt, 0, bullet);
-  writeLines(abs, lines);
-  return { written: true, origin: `${rel}#${month}`, file: rel };
+  return createdAt.slice(0, 10) || todayISO();
 }
-function writeEntity(root, kind, rel, content, rank, keywords = []) {
-  const title = titleFrom(content, keywords);
-  if (kind === "decision") return writeDecision(root, rel, content, title);
-  if (kind === "gotcha") return writeMonthlyFile(root, rel, "# Gotchas", `- **${title}**: ${content}`);
-  return writeMonthlyFile(root, rel, "# Technical Debt", `- **[${rank}] ${title}**: ${content}`);
-}
-function syncEntityToFile(db, root, kind) {
-  const target = getTarget(db, kind);
-  if (!target.enabled) return { file: target.path, written: 0, origin: "" };
-  const rel = target.path;
-  const abs = join(root, rel);
-  let existingNorm = "";
-  if (isFile(abs)) existingNorm = stripMarkdown(readFileSync(abs, "utf8"));
-  const rows = db.prepare("SELECT * FROM memories WHERE kind = ? ORDER BY created_at ASC").all(kind).map(
-    (r) => r
-  );
-  let written = 0;
-  let origin = "";
-  for (const f of rows) {
-    if (existingNorm.includes(f.content)) continue;
-    const res = writeEntity(root, kind, rel, f.content, f.rank, f.keywords ? f.keywords.split(",") : []);
-    if (res.written) {
-      written++;
-      origin = res.origin;
-      existingNorm = isFile(abs) ? stripMarkdown(readFileSync(abs, "utf8")) : `${existingNorm}
-${f.content}
-`;
-    }
+function exportChangelog(db, root) {
+  const lines = ["# Changelog", ""];
+  for (const fact of listChangelog(db)) {
+    lines.push(`## ${labelFromOrigin(fact.origin, fact.created_at)}`, "");
+    const content = fact.content.trim();
+    if (content) lines.push(content, "");
   }
-  return { file: rel, written, origin };
+  while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  lines.push("");
+  const abs = join3(root, CHANGELOG_REL);
+  mkdirSync3(join3(abs, ".."), { recursive: true });
+  writeFileSync2(abs, lines.join("\n"));
+  return CHANGELOG_REL;
 }
-function removeEntityLine(root, rel, content) {
-  const abs = join(root, rel);
-  if (!isFile(abs)) return false;
-  const lines = normalizedLines(readFileSync(abs, "utf8"));
-  const kept = lines.filter((l) => !stripMarkdown(l.trim()).includes(content));
-  if (kept.length === lines.length) return false;
-  writeLines(abs, kept);
-  return true;
+function listCheckpoints(db) {
+  const rows = db.prepare("SELECT label, commit_sha, journal_seq, created_at FROM version_checkpoints ORDER BY created_at ASC").all();
+  return rows.map((r) => ({
+    label: r.label,
+    commitSha: r.commit_sha ?? null,
+    journalSeq: r.journal_seq ?? null,
+    createdAt: r.created_at
+  }));
 }
-function docsFooterLines(root, db) {
-  const items = [
-    { rel: "AGENTS.md", note: "bootstrap rules" },
-    { rel: "docs/Changelog.md", note: "chronicle" },
-    { rel: "docs/context.md", note: "environment reference" },
-    { rel: "docs/architecture", note: "architecture reference" },
-    { rel: "docs/roles", note: "audience-specific docs" }
+
+// src/ops.ts
+function formatFacts(rows) {
+  if (rows.length === 0) return "No memories found.";
+  return rows.map((f) => `#${f.id} [${f.rank}/${f.kind}] ${f.content}${f.obsolete_at ? " (obsolete)" : ""}`).join("\n");
+}
+function seedOperation(db, root, args) {
+  if (args.flags["--changed"]) {
+    const changed = changedSeedScopes(db, root, args.flags["--force"] === true);
+    if (changed.length === 0) return "No seeded files changed since last scan.";
+    return ["Changed seeded scopes:", ...changed.map((c) => `- ${c.path}: ${c.reason} (+${c.added} -${c.removed} ~${c.changed})`)].join("\n");
+  }
+  const target = args.positional[0];
+  if (!target) return "Usage: /hw-seed <path> [--apply] [--changed]";
+  const apply = args.flags["--apply"] === true;
+  const report = apply ? applySeed(db, root, target) : planSeed(db, root, target);
+  const changes = report.changes;
+  const count = (status) => changes.filter((c) => c.status === status).length;
+  const lines = [
+    `${apply ? "APPLIED" : "DRY-RUN"} seed ${report.path}: files=${report.files} skipped=${report.skipped} blocks=${report.blocks.length}`,
+    `inserted=${count("inserted")} updated=${count("updated-content")} rebound=${count("rebound")} demoted=${count("demoted")} merged=${count("merged")} unchanged=${count("unchanged")}`
   ];
-  const managed = db ? listTargets(db).filter((t) => t.enabled).map((t) => ({ rel: t.path, note: `${t.kind} write-back` })) : MANAGED_KINDS.map((k) => ({ rel: DEFAULT_TARGET_PATH[k], note: `${k} write-back` }));
-  for (const m of managed) items.push(m);
-  return items.filter((i) => existsSync(join(root, i.rel))).map((i) => `${i.rel} \u2014 ${i.note}`);
+  for (const err of report.errors) lines.push(`error: ${err}`);
+  if (!apply && changes.length > 0) {
+    lines.push("", "Preview:");
+    for (const c of changes.slice(0, 20)) lines.push(`- [${c.block.kind}/${c.block.rank}] ${c.status}: ${c.block.content}`);
+  }
+  if (!apply && changes.length > 0) lines.push("", "Run /hw-seed <path> --apply to commit.");
+  return lines.join("\n");
+}
+function docsOperation(db, root, args) {
+  const apply = args.flags["--apply"] === true;
+  const ids = typeof args.flags["--id"] === "string" ? [Number(args.flags["--id"])].filter(Number.isFinite) : void 0;
+  const report = apply ? applyDocs(db, root, ids) : planDocs(db, root);
+  const lines = [
+    `${apply ? "APPLIED" : "DRY-RUN"} docs: proposals=${report.proposals.length} writes=${report.writes.length} removals=${report.removals.length}`
+  ];
+  if (report.drift.length > 0) {
+    lines.push("", "Drifted seeded files:");
+    for (const d of report.drift) {
+      lines.push(`- ${d.path}: +${d.added} -${d.removed} ~${d.changed}${d.agentAttributed ? " (agent edit)" : ""}`);
+    }
+  }
+  if (report.proposals.length > 0) {
+    lines.push("", "Pending doc updates:");
+    for (const p of report.proposals) lines.push(`- #${p.id} ${p.file}: ${p.content}`);
+  }
+  if (report.writes.length > 0) {
+    lines.push("", "Writes:");
+    for (const w of report.writes) lines.push(`- ${w.file}: ${w.added} line(s)`);
+  }
+  if (report.removals.length > 0) {
+    lines.push("", "Removals:");
+    for (const r of report.removals) lines.push(`- ${r.file}: ${r.content}`);
+  }
+  if (!apply) lines.push("", "Run /hw-docs --apply to write approved updates.");
+  return lines.join("\n");
+}
+function changesOperation(db, root, args, uncommitted = []) {
+  const version2 = args.positional[0];
+  const source = typeof args.flags["--source"] === "string" ? args.flags["--source"] : getChangelogSource(db);
+  const summary = args.flags["--ai"] === true ? "ai" : args.flags["--deterministic"] === true ? "deterministic" : getChangelogSummary(db);
+  const save = args.flags["--no-save"] !== true;
+  const report = collectChanges(db, root, version2, { source, summary, save, uncommitted });
+  const lines = [`# Changes since ${report.anchor.label} (${report.source})`, "", report.text];
+  if (typeof args.flags["--source"] !== "string") lines.push("", `Source: ${report.source} (override with --source git|journal).`);
+  if (report.savedId) lines.push(`Saved as changelog #${report.savedId}.`);
+  if (args.flags["--export"] === true) lines.push(`Exported to ${exportChangelog(db, root)}.`);
+  const checkpoints = listCheckpoints(db);
+  if (checkpoints.length > 0) lines.push("", `Checkpoints: ${checkpoints.map((c) => c.label).join(", ")}`);
+  if (summary === "ai") {
+    return {
+      text: lines.join("\n"),
+      aiPrompt: `Rewrite this change list as a concise human-readable release note. Keep every version/feature name and do not invent details.
+
+${report.text}`
+    };
+  }
+  return { text: lines.join("\n") };
+}
+function dashboardOperation(db, root, args) {
+  maintain(db);
+  const debts = listDebt(db).slice(0, 10);
+  const reminders = listReminders(db).slice(0, 10);
+  const prunes = listPendingPrunes(db);
+  const proposals = listDocUpdates(db).filter((p) => p.reason);
+  const lines = [
+    `## hw-memory dashboard (${countFacts(db)} facts)`,
+    "",
+    `### Top debts (${debts.length})`,
+    formatFacts(debts),
+    "",
+    `### Top reminders (${reminders.length})`,
+    formatFacts(reminders)
+  ];
+  if (prunes.length > 0) {
+    lines.push("", "### Proposed medium-rank prunes (require approval)");
+    for (const p of prunes) lines.push(`- #${p.fact_id} [${p.rank}/${p.kind}] ${p.content} (w=${p.weight.toFixed(3)})`);
+    lines.push("Run /hw-dashboard --prune to approve all.");
+  }
+  if (proposals.length > 0) {
+    lines.push("", `### Pending doc updates (${proposals.length}) \u2014 run /hw-docs to review`);
+  }
+  if (args.flags["--prune"] === true) {
+    let approved = 0;
+    for (const p of prunes) if (resolvePrune(db, p.fact_id, true)) approved++;
+    lines.push("", `Approved ${approved} prune proposal(s).`);
+  }
+  const drift = scanDrift(db, root, { force: args.flags["--force"] === true });
+  if (drift.length > 0) {
+    lines.push("", "### Drifted seeded files");
+    for (const d of drift) lines.push(`- ${d.path}: +${d.added} -${d.removed} ~${d.changed}`);
+  }
+  return lines.join("\n");
+}
+function debtsOperation(db) {
+  const rows = listDebt(db);
+  return rows.length === 0 ? "No open technical debt." : formatFacts(rows);
+}
+function remindersOperation(db) {
+  const rows = listReminders(db);
+  return rows.length === 0 ? "No reminders." : formatFacts(rows);
+}
+
+// src/commands.ts
+var COMMAND_NAMES = [
+  "hw-changes",
+  "hw-seed",
+  "hw-docs",
+  "hw-dashboard",
+  "hw-debts",
+  "hw-reminders"
+];
+function parseCommandArgs(raw, name) {
+  let text = raw.trim();
+  if (name) {
+    const prefixed = `/${name}`;
+    if (text.startsWith(prefixed)) text = text.slice(prefixed.length).trim();
+    else if (text.startsWith(name)) text = text.slice(name.length).trim();
+  }
+  const positional = [];
+  const flags = {};
+  for (const token of text.split(/\s+/).filter(Boolean)) {
+    if (!token.startsWith("--")) {
+      positional.push(token);
+      continue;
+    }
+    const eq = token.indexOf("=");
+    if (eq > 0) flags[token.slice(0, eq)] = token.slice(eq + 1);
+    else flags[token] = true;
+  }
+  return { positional, flags };
+}
+var runners = {
+  "hw-changes": async (args, ctx) => {
+    let uncommitted = [];
+    try {
+      const status = await ctx.vcs.status();
+      const files = status?.data ?? status?.files ?? status?.changes ?? [];
+      uncommitted = Array.isArray(files) ? files.map((f) => `${f.status ?? "changed"}: ${f.path ?? f.file ?? JSON.stringify(f)}`) : [];
+    } catch {
+      uncommitted = [];
+    }
+    return changesOperation(ctx.__db, ctx.__root, args, uncommitted);
+  },
+  "hw-seed": async (args, ctx) => ({ text: seedOperation(ctx.__db, ctx.__root, args) }),
+  "hw-docs": async (args, ctx) => ({ text: docsOperation(ctx.__db, ctx.__root, args) }),
+  "hw-dashboard": async (args, ctx) => ({ text: dashboardOperation(ctx.__db, ctx.__root, args) }),
+  "hw-debts": async (args, ctx) => ({ text: debtsOperation(ctx.__db) }),
+  "hw-reminders": async (args, ctx) => ({ text: remindersOperation(ctx.__db) })
+};
+var descriptions = {
+  "hw-changes": "Show a human-readable list of project changes since a version/checkpoint.",
+  "hw-seed": "Seed memory from a file or folder. Dry-run by default; --apply commits.",
+  "hw-docs": "Review and write proposed doc updates; report drift in seeded files.",
+  "hw-dashboard": "Show top debts, reminders, prune proposals and pending doc updates.",
+  "hw-debts": "List all open technical debt by current weight.",
+  "hw-reminders": "List all reminders by current weight."
+};
+async function registerCommands(ctx, db, root) {
+  const scoped = Object.create(ctx);
+  scoped.__db = db;
+  scoped.__root = root;
+  await ctx.command.transform((editor) => {
+    for (const name of COMMAND_NAMES) {
+      editor.add({
+        name,
+        description: descriptions[name],
+        execute: async ({ sessionID, prompt, delivery }) => {
+          const args = parseCommandArgs(prompt?.text ?? "", name);
+          const result = await runners[name](args, scoped);
+          if (result.aiPrompt) {
+            await ctx.session.prompt({ ...prompt, sessionID, text: result.aiPrompt, delivery });
+            await ctx.session.synthetic({ sessionID, text: result.text });
+          } else {
+            await ctx.session.synthetic({ sessionID, text: result.text });
+          }
+        }
+      });
+    }
+  });
 }
 
 // src/extract.ts
@@ -13575,7 +14818,7 @@ function defineTextTool(spec) {
     execute: async (input) => ({ content: await spec.run(spec.schema.parse(input)) })
   };
 }
-function formatFacts(rows) {
+function formatFacts2(rows) {
   if (rows.length === 0) return "No memories found.";
   return rows.map((f) => `#${f.id} [${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`).join("\n");
 }
@@ -13586,7 +14829,7 @@ function makeTools(root, db) {
     schema: external_exports.object({
       content: external_exports.string().describe("One dense fact, single sentence or two. Language-agnostic."),
       keywords: external_exports.string().optional().describe("3-6 comma-separated terms that boost keyword search."),
-      kind: external_exports.enum(["decision", "gotcha", "debt", "error", "dependency", "fact", "changelog"]).optional().describe("Fact category. decision/gotcha/debt are also written to their managed file when enabled."),
+      kind: external_exports.enum(["decision", "gotcha", "debt", "changelog", "reminder", "error", "dependency", "fact"]).optional().describe("Fact category. reminder stores plans, open questions and refactor notes; changelog stores release notes."),
       rank: external_exports.enum(["critical", "high", "medium", "low"]).optional().describe(
         "critical: never fades. high: slow decay, never pruned. medium: default. low: fades fast. Debt is clamped to medium..critical."
       )
@@ -13601,8 +14844,9 @@ function makeTools(root, db) {
       });
       let note = "";
       if (res.status === "inserted" && isManagedKind(res.kind)) {
-        const sync = syncEntityToFile(db, root, res.kind);
-        if (sync.written > 0) note = ` Also written to ${sync.file}.`;
+        if (queueDocUpdate(db, { id: res.id, kind: res.kind, content: args.content, origin: null })) {
+          note = " Doc update proposed \u2014 run /hw-docs to review.";
+        }
       }
       const debtNote = res.kind === "debt" ? " \u26A0 Technical debt recorded \u2014 tell the user about it before finishing the task." : "";
       return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}${debtNote}`;
@@ -13618,7 +14862,7 @@ function makeTools(root, db) {
     async run(args) {
       maintain(db);
       const hits = searchFacts(db, args.query, { limit: args.limit ?? 5 });
-      return formatFacts(hits);
+      return formatFacts2(hits);
     }
   });
   const memoryStats = defineTextTool({
@@ -13636,9 +14880,8 @@ function makeTools(root, db) {
         `open debt: ${stats.debt}`,
         `avg weight: ${stats.avgWeight.toFixed(3)}`,
         `cap: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`,
-        `db: ${join2(root, ".opencode", "hw-memory.db")}`,
-        `files: ${listTargets(db).map((t) => `${t.kind}=${t.enabled ? t.path : "off"}`).join("; ")}`,
-        `docs: ${docsFooterLines(root, db).join("; ") || "none"}`
+        `db: ${join4(root, ".opencode", "hw-memory.db")}`,
+        `files: ${listTargets(db).map((t) => `${t.kind}=${t.enabled ? t.path : "off"}`).join("; ")}`
       ];
       return lines.join("\n");
     }
@@ -13651,27 +14894,8 @@ function makeTools(root, db) {
       return forgetFact(db, args.id) ? `Deleted #${args.id}.` : `#${args.id} not found.`;
     }
   });
-  const memorySeed = defineTextTool({
-    description: "Seed or re-sync memory from docs/ markdown. On an empty DB this is the first-time seed; afterwards it imports new facts, updates changed, demotes vanished, and reports crucial facts missing from docs. Direct user command only \u2014 never run on your own initiative. Default is a dry-run report; apply with apply=true.",
-    name: "hw_memory_seed",
-    schema: external_exports.object({ apply: external_exports.boolean().optional().describe("Apply changes. Default false (dry-run report).") }),
-    async run(args) {
-      const report = reSeedFromDocs(db, root, args.apply ?? false);
-      const lines = [
-        `${report.apply ? "APPLIED" : "DRY-RUN"} re-seed: files=${report.files} docFacts=${report.docFacts}`,
-        `inserted=${report.inserted} updatedContent=${report.updatedContent} rebound=${report.rebound} demoted=${report.demoted} merged=${report.merged} unchanged=${report.unchanged}`
-      ];
-      if (report.missingFromDocs.length > 0) {
-        lines.push("", `Crucial facts present in memory but missing from docs (${report.missingFromDocs.length}):`);
-        for (const m of report.missingFromDocs.slice(0, 20)) {
-          lines.push(`- #${m.id} [${m.rank}/${m.kind}] ${m.content}`);
-        }
-      }
-      return lines.join("\n");
-    }
-  });
   const memoryDebt = defineTextTool({
-    description: "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id removes it (and its line from the managed debt file when enabled). Always tell the user about new debt before finishing a task.",
+    description: "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id marks it resolved (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
     name: "hw_memory_debt",
     schema: external_exports.object({
       action: external_exports.enum(["list", "resolve"]).optional().describe("list (default) or resolve."),
@@ -13682,9 +14906,7 @@ function makeTools(root, db) {
         if (args.id == null) return "Provide the debt id to resolve.";
         const fact = resolveDebt(db, args.id);
         if (!fact) return `#${args.id} is not an open debt item.`;
-        const target = getTarget(db, "debt");
-        if (target.enabled) removeEntityLine(root, target.path, fact.content);
-        return `Resolved and removed debt #${args.id}.`;
+        return `Resolved debt #${args.id}. Its managed-doc line, if any, is removed on /hw-docs --apply.`;
       }
       const rows = listDebt(db);
       if (rows.length === 0) return "No open technical debt.";
@@ -13692,12 +14914,14 @@ function makeTools(root, db) {
     }
   });
   const memoryConfig = defineTextTool({
-    description: "Get or set hw-memory configuration for this project. Managed-file write-back: decision, gotcha and debt can each be enabled/disabled; each writes to its fixed file in docs/hw-memory/ (decisions.md, gotchas.md, debt.md). Capacity: cap_rows limits how many facts the DB keeps (default 500); above it the weakest medium/low facts are evicted first and critical/high/debt are never evicted. Lowering cap_rows enforces it immediately.",
+    description: "Get or set hw-memory configuration for this project. Managed docs: decision, gotcha, debt, reminder and changelog can each be enabled/disabled; each writes to docs/hw-memory/ only after /hw-docs --apply. Capacity: cap_rows limits how many facts the DB keeps (default 500); debt, reminders and changelog are never evicted. Changelog: changelog_source (auto|git|journal) and changelog_summary (deterministic|ai). Lowering cap_rows enforces it immediately.",
     name: "hw_memory_config",
     schema: external_exports.object({
-      entity: external_exports.enum(["decision", "gotcha", "debt"]).optional().describe("Entity to configure; omit to list all."),
+      entity: external_exports.enum(["decision", "gotcha", "debt", "reminder", "changelog"]).optional().describe("Entity to configure; omit to list all."),
       enabled: external_exports.boolean().optional().describe("Enable or disable write-back for the entity."),
-      cap_rows: external_exports.number().int().optional().describe("Max facts kept in this project's DB (50..100000); default 500. Lowering enforces it immediately.")
+      cap_rows: external_exports.number().int().optional().describe("Max facts kept in this project's DB (50..100000); default 500. Lowering enforces it immediately."),
+      changelog_source: external_exports.enum(["auto", "git", "journal"]).optional().describe("Changelog source: auto (git when available), git or journal."),
+      changelog_summary: external_exports.enum(["deterministic", "ai"]).optional().describe("Changelog summary style: deterministic bullets or AI opt-in.")
     }),
     async run(args) {
       if (args.cap_rows !== void 0) {
@@ -13706,17 +14930,21 @@ function makeTools(root, db) {
         const evicted = report.capped > 0 ? ` (evicted ${report.capped} over-cap facts)` : "";
         return `cap_rows: ${cap}${evicted}`;
       }
+      if (args.changelog_source !== void 0) return `changelog.source: ${setChangelogSource(db, args.changelog_source)}`;
+      if (args.changelog_summary !== void 0) return `changelog.summary: ${setChangelogSummary(db, args.changelog_summary)}`;
       if (!args.entity) {
         return [
           ...listTargets(db).map((t2) => `${t2.kind}: ${t2.enabled ? "enabled" : "disabled"} -> ${t2.path}`),
-          `cap_rows: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`
+          `cap_rows: ${getCapRows(db)} (default ${DEFAULT_CAP_ROWS})`,
+          `changelog.source: ${getChangelogSource(db)}`,
+          `changelog.summary: ${getChangelogSummary(db)}`
         ].join("\n");
       }
       const t = setTarget(db, args.entity, { enabled: args.enabled });
       return `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`;
     }
   });
-  return [memoryAdd, memorySearch, memoryStats, memoryForget, memorySeed, memoryDebt, memoryConfig];
+  return [memoryAdd, memorySearch, memoryStats, memoryForget, memoryDebt, memoryConfig];
 }
 function registerTools(editor, root, db) {
   for (const tool of makeTools(root, db)) editor.add(tool);
@@ -13743,10 +14971,12 @@ var HwMemoryPlugin = {
   id: "hw-memory",
   async setup(ctx) {
     const root = ctx.location.directory;
-    const db = await openDBFile(join2(root, ".opencode", "hw-memory.db"));
+    const db = await openDBFile(join4(root, ".opencode", "hw-memory.db"));
     initSchema(db);
     const tracker = new SessionTracker();
     const controller = new AbortController();
+    const forceScan = /* @__PURE__ */ new Set();
+    let lastScan = 0;
     const storeCandidate = (sessionID, candidate, origin) => {
       addFact(db, {
         content: candidate.content,
@@ -13761,14 +14991,23 @@ var HwMemoryPlugin = {
       const fact = getFact(db, id);
       if (!fact || fact.kind !== "error") return;
       db.prepare("UPDATE memories SET kind = 'gotcha', rank = 'high', weight = 1.0, last_verified_at = ? WHERE id = ?").run((/* @__PURE__ */ new Date()).toISOString(), id);
-      const sync = syncEntityToFile(db, root, "gotcha");
-      if (sync.written > 0 && sync.origin) updateOrigin(db, id, sync.origin);
+      queueDocUpdate(db, { id, kind: "gotcha", content: fact.content, origin: fact.origin }, void 0, void 0, "error promoted to gotcha");
     };
     const pack = () => {
       maintain(db);
-      return wakeUpPack(db, docsFooterLines(root, db));
+      return wakeUpPack(db);
     };
     await ctx.tool.transform((editor) => registerTools(editor, root, db));
+    await registerCommands(ctx, db, root);
+    await ctx.session.hook("prompt", (event) => {
+      try {
+        const text = String(event?.prompt?.text ?? "").toLowerCase();
+        if (/(task finished|finished the task|task complete|done|готово|завершено)/.test(text)) {
+          forceScan.add(event.sessionID);
+        }
+      } catch {
+      }
+    });
     await ctx.session.hook("context", (event) => {
       try {
         event.system.push({ type: "text", text: pack() });
@@ -13793,8 +15032,16 @@ var HwMemoryPlugin = {
     });
     await ctx.tool.hook("execute.after", (event) => {
       try {
-        if (event.tool !== "bash") return;
         if (event.status !== "completed") return;
+        const fileTools = ["write", "edit", "patch", "apply_patch", "multitool"];
+        if (fileTools.includes(event.tool)) {
+          const input = event.input;
+          const pathValue = input?.path ?? input?.file ?? input?.filePath ?? input?.filename;
+          if (typeof pathValue === "string" && pathValue.length > 0) {
+            noteToolFileChange(db, event.sessionID, pathValue, `${event.tool}: ${pathValue}`);
+          }
+        }
+        if (event.tool !== "bash") return;
         const cmd = typeof event.input?.command === "string" ? event.input.command : "";
         const text = resultText(event.result.content);
         const exit = typeof event.result.metadata?.exitCode === "number" ? event.result.metadata.exitCode : void 0;
@@ -13828,6 +15075,22 @@ var HwMemoryPlugin = {
         await extractSessionDecisions(sessionID, messages, tracker, (id, candidate) => storeCandidate(id, candidate));
       } catch (e) {
         console.error("hw-memory assistant extraction failed:", e);
+      }
+      try {
+        const forced = forceScan.delete(sessionID);
+        if (!forced && Date.now() - lastScan < 36e5) return;
+        lastScan = Date.now();
+        const drift = scanDrift(db, root, { force: true });
+        if (drift.length === 0) return;
+        const lines = drift.map(
+          (d) => `- ${d.path}: +${d.added} -${d.removed} ~${d.changed}${d.agentAttributed ? " (agent edit)" : ""}`
+        );
+        await ctx.session.synthetic({
+          sessionID,
+          text: ["## hw-memory: seeded files changed", ...lines, "", "Run /hw-seed <path> to review."].join("\n")
+        });
+      } catch (e) {
+        console.error("hw-memory drift scan failed:", e);
       }
     };
     void (async () => {

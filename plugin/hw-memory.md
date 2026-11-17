@@ -1,12 +1,26 @@
 # hw-memory — persistent project memory
 
-You have permanent project memory via hw-memory tools. The project's `docs/` markdown is the source of truth; the memory DB is a ranked, decaying index over it plus episodic facts from sessions.
+You have permanent project memory via hw-memory tools and `/hw-*` commands. The memory DB is a ranked, decaying index plus episodic facts from sessions. Docs remain human-owned; hw-memory never seeds or edits them without an explicit command and approval.
+
+## Commands (direct user invocation only)
+
+- `/hw-seed <path> [--apply] [--changed]`: seed memory from one file (no size cap) or a folder (capped). Dry-run report by default; `--apply` commits. Never seed on your own initiative.
+- `/hw-docs [--apply] [--id N]`: review proposed doc updates and seeded-file drift. Writes only after approval. Doc files under `docs/hw-memory/` are plugin-managed; no markers in human docs.
+- `/hw-changes [version] [--source git|journal] [--ai] [--export]`: human-readable change list since a git tag or checkpoint. Deterministic by default; `--ai` is opt-in and calls a model.
+- `/hw-dashboard [--prune]`: top debts, reminders, prune proposals and pending doc updates. `--prune` approves all proposed medium-rank prunes.
+- `/hw-debts`: list open technical debt. `/hw-reminders`: list reminders, plans and open questions.
+
+Use `hw_memory_add` for new facts, `hw_memory_search` to recall them, `hw_memory_stats`/`hw_memory_forget`/`hw_memory_debt`/`hw_memory_config` for maintenance. Tool names keep the `hw_memory_` prefix; commands use `hw-`.
 
 ## When to store (hw_memory_add)
 
 - **After resolving a non-obvious error or pitfall** — `kind: gotcha, rank: high`. One fact per call, dense, language-agnostic.
 - **When the user pins a decision or constraint** ("remember that...", "we'll always...", "never change...") — `kind: decision`, `rank: high` (or `critical` for never-forget rules).
 - **When you learn a durable project fact** not derivable quickly from code — `kind: fact`, default rank.
+- **For plans, TODOs and open questions** — `kind: reminder, rank: medium`. Reminders are never pruned.
+- **For release notes gathered by `/hw-changes`** — `kind: changelog`. Stored automatically; `docs/hw-memory/changelog.md` is exported on request.
+
+`error` and `dependency` are internal auto-only kinds from tool-output extraction; do not add them manually.
 
 ## Technical debt (hw_memory_add kind: debt / hw_memory_debt)
 
@@ -15,33 +29,32 @@ You have permanent project memory via hw-memory tools. The project's `docs/` mar
 - **Before finishing a task you MUST tell the user about every debt item you recorded in that task.** Use `hw_memory_debt` (`action: list`) to recall the open items.
 - Use `hw_memory_debt` (`action: list`) to review open debt when the user asks about known issues.
 
-## Managed files (hw_memory_config)
+## Pruning and obsolescence
 
-- `decision`, `gotcha` and `debt` facts live in the DB. Each entity can *optionally* also be written to a markdown file.
-- Fresh installs have all three **disabled** (DB only). Enable them with `hw_memory_config` (`entity`, `enabled`); they write to fixed files `docs/hw-memory/decisions.md`, `gotchas.md`, `debt.md`.
+- `debt`, `reminder` and `changelog` facts are **never** pruned or capped.
+- `critical` facts are never pruned. `high` decisions/gotchas are protected until marked obsolete, then demoted to `low`.
+- `medium` decisions/gotchas that decay below weight 0.2 are **proposed**, not deleted. Review with `/hw-dashboard` and approve with `--prune`.
+- `low` facts and low-rank non-special facts are pruned silently. All kinds still decay by age and access.
+- `cap_rows` keeps at most 500 facts by default; configure with `hw_memory_config` (`cap_rows`, 50..100000).
 
-## Capacity (hw_memory_config cap_rows)
+## Managed docs (hw_memory_config / /hw-docs)
 
-- Each project DB keeps at most **500 facts** by default. `hw_memory_config` (`cap_rows`) changes the limit for this project (50..100000).
-- Above the cap, the weakest `medium`/`low` facts are evicted first; `critical`, `high` and `debt` are never evicted.
-- Lowering the cap applies immediately and may evict facts.
+- `decision`, `gotcha`, `debt`, `reminder`, `changelog` facts can be exported into `docs/hw-memory/{decisions,gotchas,debt,reminders,changelog}.md`.
+- Adding a managed fact **queues a proposal**; it does not write the file. Review with `/hw-docs`, then write with `/hw-docs --apply`.
+- The safe writer only appends bullets and removes exact plugin-written lines for obsolete facts. User prose is never overwritten. No markers are inserted into docs.
+- `hw_memory_config` toggles each entity and sets `cap_rows`, `changelog.source` (`auto|git|journal`, default `auto`) and `changelog.summary` (`deterministic|ai`, default `deterministic`).
 
 ## When to recall (hw_memory_search)
 
 - Before risky or uncertain work, and whenever a past decision, pitfall or constraint might exist.
 - When the user references something "we decided earlier" or "remember the issue with...".
 
-## Re-seed — direct user command only
-
-- `hw_memory_seed`: **never run on your own initiative.** Only when the user explicitly asks (e.g. "seed memory", "re-seed memory"). Default is a dry-run report — show it to the user and apply (`apply: true`) only after they confirm.
-- `hw_memory_seed` is also the first-time seed: on a fresh install the memory DB is empty until the user runs it. If memory is empty and the project has docs/, mention to the user that seeding is available.
-- Suggest re-seed when the user mentions they edited docs/ markdown manually.
-
 ## Rules
 
 - One fact per `hw_memory_add` call. If the response says "Updated (duplicate)" the fact was already known — no need to store more.
-- If a recalled fact conflicts with its source doc file (`src:` pointer), the doc file wins.
-- Do not re-store facts that live in docs/ — seeding already indexed them (or will, once the user runs hw_memory_seed).
+- Seeded facts carry a source path (`src:` pointer). If a recalled fact conflicts with its source file, the file wins.
+- Do not re-store facts already indexed from a seeded file; re-run `/hw-seed <path> --apply` after the user edits that file.
 - Do not store run-specific data (build output, test numbers) — only durable knowledge.
 - In all cases do not store any credentials or secrets - only a way to access them (for example - from config files).
-- Ranks: `critical` never fades, `high` fades slowly (both never auto-deleted), `medium` default, `low` for ephemera that should fade fast.
+- Completion phrases in your prompt ("task finished", "done", "готово") force a drift check on session idle; a throttled idle scan reports changed seeded files.
+- Ranks: `critical` never fades, `high` fades slowly, `medium` default, `low` for ephemera that should fade fast.

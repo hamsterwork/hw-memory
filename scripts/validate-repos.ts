@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { openDBFile } from "../src/db.ts"
 import { initSchema, searchFacts, statsFacts, wakeUpPack } from "../src/core.ts"
-import { docsFooterLines, seedFromDocs } from "../src/docs.ts"
+import { applySeed } from "../src/seed.ts"
 
 const repos = [
   "/Users/hamsterwork/Dev/wp-wifly-modular",
@@ -13,13 +13,12 @@ const repos = [
 for (const repo of repos) {
   const db = await openDBFile(join(mkdtempSync(join(tmpdir(), "hwm-val-")), "hw-memory.db"))
   initSchema(db)
-  const report = seedFromDocs(db, repo)
+  const report = applySeed(db, repo, "docs")
   console.log(`\n=== ${repo} ===`)
-  console.log("seed:", JSON.stringify(report))
-  console.log("footer:", docsFooterLines(repo).join(" | "))
+  console.log("seed:", `files=${report.files} blocks=${report.blocks.length} errors=${report.errors.length}`)
   console.log("stats:", JSON.stringify(statsFacts(db)))
   console.log("--- wake-up pack ---")
-  console.log(wakeUpPack(db, docsFooterLines(repo)))
+  console.log(wakeUpPack(db))
   for (const query of ["auth", "test suite", "медиа", "postgres"]) {
     const hits = searchFacts(db, query, { limit: 3 })
     console.log(`search "${query}":`, hits.map((h) => `[${h.rank}/${h.kind}] ${h.content.slice(0, 90)}`))

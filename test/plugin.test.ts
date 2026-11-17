@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import HwMemoryPlugin, { HwMemoryPlugin as Named, extractSessionDecisions } from "../src/hw-memory.ts"
@@ -23,9 +23,17 @@ const TOOL_NAMES = [
   "hw_memory_search",
   "hw_memory_stats",
   "hw_memory_forget",
-  "hw_memory_seed",
   "hw_memory_debt",
   "hw_memory_config",
+]
+
+const COMMAND_NAMES = [
+  "hw-changes",
+  "hw-seed",
+  "hw-docs",
+  "hw-dashboard",
+  "hw-debts",
+  "hw-reminders",
 ]
 
 test("plugin exposes a V2 definition", async () => {
@@ -47,7 +55,7 @@ test("plugin registers all tools with JSON Schema input", async () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-test("debt flow: add warns, list shows, resolve deletes", async () => {
+test("debt flow: add warns, list shows, resolve clears the open list", async () => {
   const { root, tools, cleanup } = await setup()
   const add = text(
     await tools.hw_memory_add.execute({
@@ -67,8 +75,8 @@ test("debt flow: add warns, list shows, resolve deletes", async () => {
   rmSync(root, { recursive: true, force: true })
 })
 
-test("enabling a target makes add write the managed file", async () => {
-  const { root, tools, cleanup } = await setup()
+test("enabling a target queues a doc update instead of writing immediately", async () => {
+  const { root, tools, commands, runCommand, output, cleanup } = await setup()
   const before = text(await tools.hw_memory_config.execute({}))
   assert.match(before, /decision: disabled/)
   await tools.hw_memory_config.execute({ entity: "decision", enabled: true })
@@ -79,8 +87,14 @@ test("enabling a target makes add write the managed file", async () => {
       rank: "critical",
     }),
   )
-  assert.match(add, /docs\/hw-memory\/decisions\.md/)
+  assert.match(add, /Doc update proposed/)
+  assert.ok(!existsSync(join(root, "docs", "hw-memory", "decisions.md")))
+  await runCommand("hw-docs")
+  assert.match(output.synthetic.at(-1) ?? "", /proposals=1/)
+  await runCommand("hw-docs", "--apply")
+  assert.match(output.synthetic.at(-1) ?? "", /APPLIED docs/)
   assert.ok(existsSync(join(root, "docs", "hw-memory", "decisions.md")))
+  assert.ok(commands["hw-docs"])
   await cleanup()
   rmSync(root, { recursive: true, force: true })
 })
@@ -184,11 +198,66 @@ test("config exposes and sets cap_rows", async () => {
 
   const after = text(await tools.hw_memory_config.execute({}))
   assert.match(after, /cap_rows: 1500 \(default 500\)/)
+  assert.match(after, /changelog\.source: auto/)
+  assert.match(after, /changelog\.summary: deterministic/)
+
+  assert.match(text(await tools.hw_memory_config.execute({ changelog_source: "journal" })), /changelog\.source: journal/)
+  assert.match(text(await tools.hw_memory_config.execute({ changelog_summary: "ai" })), /changelog\.summary: ai/)
 
   const stats = text(await tools.hw_memory_stats.execute({}))
   assert.match(stats, /cap: 1500 \(default 500\)/)
 
   await assert.rejects(tools.hw_memory_config.execute({ cap_rows: 10 }), /cap_rows must be an integer/)
+  await cleanup()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("plugin registers only hw-* commands", async () => {
+  const { root, commands, cleanup } = await setup()
+  assert.deepEqual(Object.keys(commands).sort(), [...COMMAND_NAMES].sort())
+  for (const name of COMMAND_NAMES) assert.ok(commands[name]?.description, `missing description for ${name}`)
+  await cleanup()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("slash commands emit deterministic reports through synthetic output", async () => {
+  const { root, tools, output, runCommand, cleanup } = await setup()
+  await tools.hw_memory_add.execute({
+    content: "known serializer mismatch is still unresolved",
+    kind: "debt",
+    rank: "high",
+  })
+  await tools.hw_memory_add.execute({
+    content: "follow up on the flaky markdown export test",
+    kind: "reminder",
+    rank: "medium",
+  })
+  writeFileSync(join(root, "notes.txt"), "[decision] Decided to keep the export format stable for compatibility.\n")
+
+  await runCommand("hw-debts")
+  assert.match(output.synthetic.at(-1) ?? "", /serializer mismatch/)
+  await runCommand("hw-reminders")
+  assert.match(output.synthetic.at(-1) ?? "", /flaky markdown export/)
+  await runCommand("hw-dashboard")
+  assert.match(output.synthetic.at(-1) ?? "", /hw-memory dashboard/)
+  await runCommand("hw-docs")
+  assert.match(output.synthetic.at(-1) ?? "", /DRY-RUN docs/)
+  await runCommand("hw-seed", "notes.txt")
+  assert.match(output.synthetic.at(-1) ?? "", /DRY-RUN seed notes\.txt/)
+  await runCommand("hw-changes", "--source journal --no-save")
+  assert.match(output.synthetic.at(-1) ?? "", /Changes since/)
+
+  assert.equal(output.prompt.length, 0, "deterministic commands must not call a model")
+  await cleanup()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("hw-changes --ai prompts the model and still emits deterministic bullets", async () => {
+  const { root, output, runCommand, cleanup } = await setup()
+  await runCommand("hw-changes", "--source journal --no-save --ai")
+  assert.equal(output.prompt.length, 1)
+  assert.match(output.prompt[0], /Rewrite this change list/)
+  assert.match(output.synthetic.at(-1) ?? "", /Changes since/)
   await cleanup()
   rmSync(root, { recursive: true, force: true })
 })

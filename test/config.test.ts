@@ -10,7 +10,13 @@ import {
   MAX_CAP_ROWS,
   MIN_CAP_ROWS,
   getCapRows,
+  getChangelogSource,
+  getChangelogSummary,
+  getTarget,
   setCapRows,
+  setChangelogSource,
+  setChangelogSummary,
+  setTarget,
 } from "../src/config.ts"
 
 async function fresh() {
@@ -58,6 +64,34 @@ test("invalid stored cap falls back to the default", async () => {
   assert.equal(getCapRows(db), DEFAULT_CAP_ROWS)
   db.prepare("UPDATE settings SET value = '999999' WHERE key = 'cap_rows'").run()
   assert.equal(getCapRows(db), DEFAULT_CAP_ROWS)
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test("changelog settings default and validate", async () => {
+  const { db, dir } = await fresh()
+  assert.equal(getChangelogSource(db), "auto")
+  assert.equal(getChangelogSummary(db), "deterministic")
+  assert.equal(setChangelogSource(db, "journal"), "journal")
+  assert.equal(setChangelogSummary(db, "ai"), "ai")
+  assert.equal(getChangelogSource(db), "journal")
+  assert.equal(getChangelogSummary(db), "ai")
+  assert.throws(() => setChangelogSource(db, "bogus"), /changelog\.source/)
+  assert.throws(() => setChangelogSummary(db, "bogus"), /changelog\.summary/)
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('changelog.source', 'bad')").run()
+  assert.equal(getChangelogSource(db), "auto", "invalid stored value falls back")
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test("file targets are disabled by default and settable", async () => {
+  const { db, dir } = await fresh()
+  assert.equal(getTarget(db, "debt").enabled, false)
+  const updated = setTarget(db, "debt", { enabled: true, path: "docs/hw-memory/debt.md" })
+  assert.deepEqual(updated, { kind: "debt", enabled: true, path: "docs/hw-memory/debt.md" })
+  assert.deepEqual(getTarget(db, "debt"), updated)
+  setTarget(db, "debt", { enabled: false })
+  assert.equal(getTarget(db, "debt").enabled, false)
   db.close()
   rmSync(dir, { recursive: true, force: true })
 })

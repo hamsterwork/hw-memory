@@ -15,7 +15,7 @@ writeFileSync(
   "# Gotchas\n\n## 2026-08\n\n- Stale vendor folder breaks composer install, remove it before rebuilding.\n",
 )
 
-const { ctx, tools, hooks, pushEvent } = fakeContext(root)
+const { ctx, tools, hooks, pushEvent, runCommand, output } = fakeContext(root)
 const cleanup = await HwMemoryPlugin.setup(ctx)
 console.log("--- plugin id:", HwMemoryPlugin.id)
 
@@ -24,10 +24,10 @@ for (const hook of hooks.context) await hook(system)
 console.log("--- system prompt injected:", system.system.length === 1)
 console.log(system.system[0].text.slice(0, 200))
 
-const seedDry = text(await tools.hw_memory_seed.execute({}))
-console.log("--- hw_memory_seed dry-run:", seedDry.split("\n")[0])
-const seedApply = text(await tools.hw_memory_seed.execute({ apply: true }))
-console.log("--- hw_memory_seed applied:", seedApply.split("\n")[0])
+await runCommand("hw-seed", "AGENTS.md")
+console.log("--- /hw-seed dry-run:", (output.synthetic.at(-1) ?? "").split("\n")[0])
+await runCommand("hw-seed", "AGENTS.md --apply")
+console.log("--- /hw-seed applied:", (output.synthetic.at(-1) ?? "").split("\n")[0])
 
 const searchBefore = text(await tools.hw_memory_search.execute({ query: "composer install vendor" }))
 console.log("--- hw_memory_search:", JSON.stringify(searchBefore))
@@ -43,6 +43,9 @@ const add = text(
   }),
 )
 console.log("--- hw_memory_add:", add)
+await runCommand("hw-docs")
+console.log("--- /hw-docs dry-run:", (output.synthetic.at(-1) ?? "").split("\n")[0])
+await runCommand("hw-docs", "--apply")
 console.log("--- docs/hw-memory/decisions.md written:", existsSync(join(root, "docs", "hw-memory", "decisions.md")))
 console.log(readFileSync(join(root, "docs", "hw-memory", "decisions.md"), "utf8"))
 
