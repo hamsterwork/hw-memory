@@ -1,4 +1,4 @@
-// hw-memory v1.0.0
+// hw-memory v1.1.0
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
