@@ -73,7 +73,7 @@ Reports are deterministic; only `/hw-changes --ai` calls a model.
 
 ### Tools
 
-`hw_memory_add`, `hw_memory_search`, `hw_memory_stats`, `hw_memory_forget`, `hw_memory_debt` (list/resolve technical debt) and `hw_memory_config` (settings). Just ask your agent to remember, recall or configure something — it will pick the right tool.
+`hw_memory_add`, `hw_memory_search`, `hw_memory_stats`, `hw_memory_forget`, `hw_memory_debt` (list/verify/resolve technical debt), `hw_memory_reminder` (list/verify/resolve reminders) and `hw_memory_config` (settings). Just ask your agent to remember, recall or configure something — it will pick the right tool.
 
 ### Settings
 
@@ -104,7 +104,16 @@ hw-memory never overwrites your prose in docs, never writes a doc without `/hw-d
 
 ### Managed docs
 
-For each enabled kind, new facts are queued as proposals. `/hw-docs` shows what would be written or removed; `/hw-docs --apply` writes only plugin-created lines with a safe line-based writer and leaves your own text untouched. Resolving debt with `hw_memory_debt` removes it from the open list; its doc line is removed on the next `/hw-docs --apply`.
+For each enabled kind, new facts are queued as proposals. `/hw-docs` shows what would be written or removed; `/hw-docs --apply` writes only plugin-created lines with a safe line-based writer and leaves your own text untouched. Resolving debt or a reminder with `hw_memory_debt` / `hw_memory_reminder` removes it from the open list; its doc line is removed on the next `/hw-docs --apply`.
+
+### Open items: debt and reminders
+
+Debt and reminders never decay away on their own, so they are tracked with a disposition instead of a lifetime:
+
+- `action: verify` records that the item was checked and is still open. Only the check date moves — weight and the decay clock are untouched, so re-verifying cannot keep an item alive forever.
+- `action: resolve` marks it done. It leaves every list and its managed-doc line is removed on the next `/hw-docs --apply`.
+
+Lists (`hw_memory_debt`, `hw_memory_reminder`, `/hw-debts`, `/hw-reminders`) show age as `open 41d, checked 18d ago`, and the wake-up context surfaces only the items that resemble the current task. When a task ends with a completion phrase ("done", "готово"), a bounded check names at most five undispositioned ids; a background pass covers items unchecked for a week or more. Each item is repeated at most once a day, and anything checked today is not repeated at all.
 
 ### Changelog
 
@@ -118,7 +127,7 @@ Facts lose weight with age and infrequent use, but important ones are kept: noth
 
 ```sh
 npm install
-npm test              # node --test, 92 tests
+npm test              # node --test, 101 tests
 npm run test:install  # installer checks
 npm run test:update   # updater checks
 npm run build         # rebuild plugin/hw-memory.ts

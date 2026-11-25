@@ -10,7 +10,7 @@ You have permanent project memory via hw-memory tools and `/hw-*` commands. The 
 - `/hw-dashboard [--prune]`: top debts, reminders, prune proposals and pending doc updates. `--prune` approves all proposed medium-rank prunes.
 - `/hw-debts`: list open technical debt. `/hw-reminders`: list reminders, plans and open questions.
 
-Use `hw_memory_add` for new facts, `hw_memory_search` to recall them, `hw_memory_stats`/`hw_memory_forget`/`hw_memory_debt`/`hw_memory_config` for maintenance. Tool names keep the `hw_memory_` prefix; commands use `hw-`.
+Use `hw_memory_add` for new facts, `hw_memory_search` to recall them, `hw_memory_stats`/`hw_memory_forget`/`hw_memory_debt`/`hw_memory_reminder`/`hw_memory_config` for maintenance. Tool names keep the `hw_memory_` prefix; commands use `hw-`.
 
 ## When to store (hw_memory_add)
 
@@ -22,12 +22,20 @@ Use `hw_memory_add` for new facts, `hw_memory_search` to recall them, `hw_memory
 
 `error` and `dependency` are internal auto-only kinds from tool-output extraction; do not add them manually.
 
-## Technical debt (hw_memory_add kind: debt / hw_memory_debt)
+## Open items: debt and reminders (hw_memory_debt / hw_memory_reminder)
 
 - When you notice a **bug, mismatch or error unrelated to the current task**, record it immediately: `hw_memory_add` with `kind: debt` and `rank` from `medium` to `critical` (severity reflects impact — a formatting nit is `medium`, a potential 500 is `critical`).
-- Debt is never auto-deleted and never decays away; it stays until explicitly resolved with `hw_memory_debt` (`action: resolve`).
-- **Before finishing a task you MUST tell the user about every debt item you recorded in that task.** Use `hw_memory_debt` (`action: list`) to recall the open items.
-- Use `hw_memory_debt` (`action: list`) to review open debt when the user asks about known issues.
+- Record plans, open questions and follow-ups with `kind: reminder`.
+- Both kinds stay until they are explicitly disposed of, and every list shows age (`open 41d, checked 18d ago`):
+  - `action: verify` — you checked it and it is still open. This records the check date only; weight and the decay clock are untouched, so re-verifying an item cannot keep it alive forever.
+  - `action: resolve` — it is done or no longer relevant. It leaves the lists; its managed-doc line, if any, is removed on the next `/hw-docs --apply`.
+- Use `hw_memory_debt` / `hw_memory_reminder` (`action: list`, the default) to review open items when the user asks about known issues.
+
+## Finishing a task
+
+- **Before finishing a task, dispose of every open debt/reminder the task touched** — resolve it, verify it, or leave it open with an explicit reason. New debt and reminders are reported to the user in the same turn they are recorded.
+- Completion phrases ("done", "готово") trigger a finish check on session idle; a background pass covers items unchecked for a week or more. When a check lists ids, tell the user and verify or resolve each one. An item checked today is not repeated that day.
+- Completion phrases also force a drift check of seeded files; otherwise a throttled idle scan reports changed seeded files.
 
 ## Pruning and obsolescence
 
@@ -56,5 +64,4 @@ Use `hw_memory_add` for new facts, `hw_memory_search` to recall them, `hw_memory
 - Do not re-store facts already indexed from a seeded file; re-run `/hw-seed <path> --apply` after the user edits that file.
 - Do not store run-specific data (build output, test numbers) — only durable knowledge.
 - In all cases do not store any credentials or secrets - only a way to access them (for example - from config files).
-- Completion phrases in your prompt ("task finished", "done", "готово") force a drift check on session idle; a throttled idle scan reports changed seeded files.
 - Ranks: `critical` never fades, `high` fades slowly, `medium` default, `low` for ephemera that should fade fast.

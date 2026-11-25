@@ -6,15 +6,22 @@ import type { DB } from "./db.ts"
 import { openDBFile } from "./db.ts"
 import {
   addFact,
+  countOpenItems,
+  factAgeLabel,
   forgetFact,
   getFact,
   initSchema,
   listDebt,
+  listReminders,
+  listStaleOpenItems,
   maintain,
   resolveDebt,
+  resolveFact,
   searchFacts,
   statsFacts,
+  verifyFact,
   wakeUpPack,
+  type FactRow,
   type Kind,
   type Rank,
 } from "./core.ts"
@@ -71,6 +78,13 @@ function formatFacts(rows: { id: number; rank: string; kind: string; content: st
   return rows.map((f) => `#${f.id} [${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`).join("\n")
 }
 
+/** Open items are listed with their age so staleness is visible to the model too. */
+function formatOpenRows(rows: FactRow[]): string {
+  return rows
+    .map((f) => `#${f.id} [${f.rank}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""} — ${factAgeLabel(f)}`)
+    .join("\n")
+}
+
 function makeTools(root: string, db: DB) {
   const memoryAdd = defineTextTool({
     description:
@@ -104,9 +118,13 @@ function makeTools(root: string, db: DB) {
           note = " Doc update proposed — run /hw-docs to review."
         }
       }
-      const debtNote =
-        res.kind === "debt" ? " ⚠ Technical debt recorded — tell the user about it before finishing the task." : ""
-      return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}${debtNote}`
+      const openNote =
+        res.kind === "debt"
+          ? " ⚠ Technical debt recorded — tell the user about it before finishing the task."
+          : res.kind === "reminder"
+            ? " Open item recorded — verify or resolve it before finishing the task."
+            : ""
+      return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}${openNote}`
     },
   })
 
@@ -158,13 +176,19 @@ function makeTools(root: string, db: DB) {
 
   const memoryDebt = defineTextTool({
     description:
-      "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id marks it resolved (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
+      "Technical debt found while working on other tasks. action=list (default) lists open debt with its age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
     name: "hw_memory_debt",
     schema: z.object({
-      action: z.enum(["list", "resolve"]).optional().describe("list (default) or resolve."),
-      id: z.number().optional().describe("Debt id to resolve."),
+      action: z.enum(["list", "verify", "resolve"]).optional().describe("list (default), verify or resolve."),
+      id: z.number().optional().describe("Debt id for verify/resolve."),
     }),
     async run(args) {
+      if (args.action === "verify") {
+        if (args.id == null) return "Provide the debt id to verify."
+        const fact = verifyFact(db, args.id)
+        if (!fact || fact.kind !== "debt") return `#${args.id} is not an open debt item.`
+        return `Verified debt #${args.id} (still open, checked today). Weight and decay clock unchanged.`
+      }
       if (args.action === "resolve") {
         if (args.id == null) return "Provide the debt id to resolve."
         const fact = resolveDebt(db, args.id)
@@ -173,9 +197,34 @@ function makeTools(root: string, db: DB) {
       }
       const rows = listDebt(db)
       if (rows.length === 0) return "No open technical debt."
-      return rows
-        .map((f) => `#${f.id} [${f.rank}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`)
-        .join("\n")
+      return formatOpenRows(rows)
+    },
+  })
+
+  const memoryReminder = defineTextTool({
+    description:
+      "Reminders are plans, open questions and follow-ups. action=list (default) lists open reminders with their age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (it leaves the lists; its managed-doc line, if any, is removed on /hw-docs --apply). Dispose of reminders a task touches before finishing it.",
+    name: "hw_memory_reminder",
+    schema: z.object({
+      action: z.enum(["list", "verify", "resolve"]).optional().describe("list (default), verify or resolve."),
+      id: z.number().optional().describe("Reminder id for verify/resolve."),
+    }),
+    async run(args) {
+      if (args.action === "verify") {
+        if (args.id == null) return "Provide the reminder id to verify."
+        const fact = verifyFact(db, args.id)
+        if (!fact || fact.kind !== "reminder") return `#${args.id} is not an open reminder.`
+        return `Verified reminder #${args.id} (still open, checked today). Weight and decay clock unchanged.`
+      }
+      if (args.action === "resolve") {
+        if (args.id == null) return "Provide the reminder id to resolve."
+        const fact = resolveFact(db, args.id)
+        if (!fact || fact.kind !== "reminder") return `#${args.id} is not an open reminder.`
+        return `Resolved reminder #${args.id}. Its managed-doc line, if any, is removed on /hw-docs --apply.`
+      }
+      const rows = listReminders(db)
+      if (rows.length === 0) return "No open reminders."
+      return formatOpenRows(rows)
     },
   })
 
@@ -225,7 +274,7 @@ function makeTools(root: string, db: DB) {
     },
   })
 
-  return [memoryAdd, memorySearch, memoryStats, memoryForget, memoryDebt, memoryConfig]
+  return [memoryAdd, memorySearch, memoryStats, memoryForget, memoryDebt, memoryReminder, memoryConfig]
 }
 
 function registerTools(editor: ToolEditor, root: string, db: DB): void {
@@ -271,6 +320,25 @@ function resultText(content: unknown): string {
     .join("\n")
 }
 
+/**
+ * A completion phrase ends the task. ASCII words need real boundaries — `\b` both
+ * matches inside "undone" and never matches Cyrillic, so the two scripts differ.
+ */
+const COMPLETION_ASCII = /(?<![a-z])(task finished|finished the task|task complete|task done|done)(?![a-z])/i
+const COMPLETION_CYRILLIC = /(готово|завершено|выполнено|сделано)/i
+
+export function isCompletionPhrase(text: string): boolean {
+  return COMPLETION_ASCII.test(text) || COMPLETION_CYRILLIC.test(text)
+}
+
+/** Repeat window per item: an unaddressed nudge is not repeated within a day. */
+const NUDGE_REPEAT_MS = 24 * 60 * 60 * 1000
+/** Background pass: without a completion phrase, stale items still surface this often. */
+const NUDGE_BACKGROUND_MS = 6 * 60 * 60 * 1000
+/** Background nudges only include items unchecked for at least this long. */
+const NUDGE_STALE_DAYS = 7
+const NUDGE_LIMIT = 5
+
 export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
   id: "hw-memory",
 
@@ -282,7 +350,10 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
     const tracker = new SessionTracker()
     const controller = new AbortController()
     const forceScan = new Set<string>()
+    const taskText = new Map<string, string>()
+    const nudgedAt = new Map<string, number>()
     let lastScan = 0
+    let lastNudge = Date.now()
 
     const storeCandidate = (sessionID: string, candidate: Candidate, origin?: string) => {
       addFact(db, {
@@ -303,9 +374,16 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
       queueDocUpdate(db, { id, kind: "gotcha", content: fact.content, origin: fact.origin }, undefined, undefined, "error promoted to gotcha")
     }
 
-    const pack = () => {
+    /** `task` is the last user prompt, so the pack can surface only relevant open items. */
+    const pack = (sessionID?: string) => {
       maintain(db)
-      return wakeUpPack(db)
+      return wakeUpPack(db, 2500, sessionID ? (taskText.get(sessionID) ?? "") : "")
+    }
+
+    const forgetSession = (sessionID: string) => {
+      tracker.clear(sessionID)
+      taskText.delete(sessionID)
+      for (const key of nudgedAt.keys()) if (key.startsWith(`${sessionID}:`)) nudgedAt.delete(key)
     }
 
     // The DB is open and the schema is in place before the synchronous transform runs.
@@ -314,10 +392,12 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
 
     await ctx.session.hook("prompt", (event) => {
       try {
-        const text = String(event?.prompt?.text ?? "").toLowerCase()
-        if (/(task finished|finished the task|task complete|done|готово|завершено)/.test(text)) {
-          forceScan.add(event.sessionID)
-        }
+        const text = String(event?.prompt?.text ?? "")
+        const sessionID = String(event?.sessionID ?? "")
+        if (!sessionID) return
+        if (isCompletionPhrase(text)) forceScan.add(sessionID)
+        // Keep the latest task so the next turn's pack can surface related open items.
+        if (text.trim()) taskText.set(sessionID, text)
       } catch {
         // A prompt hook must never break admission.
       }
@@ -325,7 +405,7 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
 
     await ctx.session.hook("context", (event) => {
       try {
-        event.system.push({ type: "text", text: pack() })
+        event.system.push({ type: "text", text: pack(event.sessionID) })
       } catch (e) {
         console.error("hw-memory wake-up failed:", e)
       }
@@ -391,6 +471,34 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
       }
     })
 
+    /**
+     * Bounded, idempotent finish-time nudge. Rather than dumping every open item,
+     * it names at most five that were not checked recently, gives their ids and
+     * ages, and states what to do. Each item is repeated at most once a day.
+     */
+    const nudgeOpenItems = async (sessionID: string, forced: boolean) => {
+      const now = Date.now()
+      if (!forced && now - lastNudge < NUDGE_BACKGROUND_MS) return
+      const candidates = listStaleOpenItems(db, { staleDays: forced ? 0 : NUDGE_STALE_DAYS, limit: 30 })
+      const due = candidates
+        .filter((f) => {
+          const at = nudgedAt.get(`${sessionID}:${f.id}`)
+          return at === undefined || now - at >= NUDGE_REPEAT_MS
+        })
+        .slice(0, NUDGE_LIMIT)
+      if (due.length === 0) return
+      lastNudge = now
+      for (const f of due) nudgedAt.set(`${sessionID}:${f.id}`, now)
+      const open = countOpenItems(db)
+      const lines = [
+        `## hw-memory: ${due.length} open item(s) need a decision${forced ? "" : " (stale check)"}`,
+        "Tell the user, then dispose of each: `hw_memory_debt` / `hw_memory_reminder` with `action: verify` (still open) or `action: resolve` (done).",
+        ...due.map((f) => `- #${f.id} [${f.rank}/${f.kind}] ${f.content} — ${factAgeLabel(f)}`),
+      ]
+      if (open > due.length) lines.push(`Full lists: /hw-debts and /hw-reminders (${open} open items).`)
+      await ctx.session.synthetic({ sessionID, text: lines.join("\n") })
+    }
+
     const onSessionIdle = async (sessionID: string) => {
       try {
         const messages = await ctx.session.context({ sessionID })
@@ -398,28 +506,35 @@ export const HwMemoryPlugin: OpenCode.Plugin.Plugin = {
       } catch (e) {
         console.error("hw-memory assistant extraction failed:", e)
       }
+      const forced = forceScan.delete(sessionID)
       try {
-        const forced = forceScan.delete(sessionID)
-        if (!forced && Date.now() - lastScan < 3_600_000) return
-        lastScan = Date.now()
-        const drift = scanDrift(db, root, { force: true })
-        if (drift.length === 0) return
-        const lines = drift.map(
-          (d) => `- ${d.path}: +${d.added} -${d.removed} ~${d.changed}${d.agentAttributed ? " (agent edit)" : ""}`,
-        )
-        await ctx.session.synthetic({
-          sessionID,
-          text: ["## hw-memory: seeded files changed", ...lines, "", "Run /hw-seed <path> to review."].join("\n"),
-        })
+        if (forced || Date.now() - lastScan >= 3_600_000) {
+          lastScan = Date.now()
+          const drift = scanDrift(db, root, { force: true })
+          if (drift.length > 0) {
+            const lines = drift.map(
+              (d) => `- ${d.path}: +${d.added} -${d.removed} ~${d.changed}${d.agentAttributed ? " (agent edit)" : ""}`,
+            )
+            await ctx.session.synthetic({
+              sessionID,
+              text: ["## hw-memory: seeded files changed", ...lines, "", "Run /hw-seed <path> to review."].join("\n"),
+            })
+          }
+        }
       } catch (e) {
         console.error("hw-memory drift scan failed:", e)
+      }
+      try {
+        await nudgeOpenItems(sessionID, forced)
+      } catch (e) {
+        console.error("hw-memory open-item check failed:", e)
       }
     }
 
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          if (event.type === "session.deleted") tracker.clear(event.data.sessionID)
+          if (event.type === "session.deleted") forgetSession(event.data.sessionID)
           else if (event.type === "session.idle") await onSessionIdle(event.data.sessionID)
         }
       } catch (e) {

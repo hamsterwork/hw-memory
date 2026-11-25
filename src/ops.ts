@@ -1,6 +1,9 @@
 import type { DB } from "./db.ts"
 import {
+  countDebt,
   countFacts,
+  countReminders,
+  factAgeLabel,
   listDebt,
   listPendingPrunes,
   listReminders,
@@ -14,10 +17,14 @@ import { collectChanges, exportChangelog, listCheckpoints } from "./changelog.ts
 import type { ChangelogSource, ChangelogSummary } from "./changelog.ts"
 import { getChangelogSource, getChangelogSummary } from "./config.ts"
 
-function formatFacts(rows: FactRow[]): string {
-  if (rows.length === 0) return "No memories found."
+/** Open items carry their id and age: a stale item must look stale. */
+function formatOpenItems(rows: FactRow[]): string {
+  if (rows.length === 0) return "None."
   return rows
-    .map((f) => `#${f.id} [${f.rank}/${f.kind}] ${f.content}${f.obsolete_at ? " (obsolete)" : ""}`)
+    .map(
+      (f) =>
+        `#${f.id} [${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""} — ${factAgeLabel(f)}`,
+    )
     .join("\n")
 }
 
@@ -119,11 +126,11 @@ export function dashboardOperation(db: DB, root: string, args: CommandArgs): str
   const lines = [
     `## hw-memory dashboard (${countFacts(db)} facts)`,
     "",
-    `### Top debts (${debts.length})`,
-    formatFacts(debts),
+    `### Top debts (${debts.length}/${countDebt(db)} open)`,
+    formatOpenItems(debts),
     "",
-    `### Top reminders (${reminders.length})`,
-    formatFacts(reminders),
+    `### Top reminders (${reminders.length}/${countReminders(db)} open)`,
+    formatOpenItems(reminders),
   ]
   if (prunes.length > 0) {
     lines.push("", "### Proposed medium-rank prunes (require approval)")
@@ -148,10 +155,10 @@ export function dashboardOperation(db: DB, root: string, args: CommandArgs): str
 
 export function debtsOperation(db: DB): string {
   const rows = listDebt(db)
-  return rows.length === 0 ? "No open technical debt." : formatFacts(rows)
+  return rows.length === 0 ? "No open technical debt." : formatOpenItems(rows)
 }
 
 export function remindersOperation(db: DB): string {
   const rows = listReminders(db)
-  return rows.length === 0 ? "No reminders." : formatFacts(rows)
+  return rows.length === 0 ? "No reminders." : formatOpenItems(rows)
 }

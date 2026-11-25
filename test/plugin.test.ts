@@ -3,7 +3,11 @@ import { test } from "node:test"
 import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import HwMemoryPlugin, { HwMemoryPlugin as Named, extractSessionDecisions } from "../src/hw-memory.ts"
+import HwMemoryPlugin, {
+  HwMemoryPlugin as Named,
+  extractSessionDecisions,
+  isCompletionPhrase,
+} from "../src/hw-memory.ts"
 import { SessionTracker } from "../src/extract.ts"
 import { fakeContext, text } from "./fake-context.ts"
 
@@ -24,6 +28,7 @@ const TOOL_NAMES = [
   "hw_memory_stats",
   "hw_memory_forget",
   "hw_memory_debt",
+  "hw_memory_reminder",
   "hw_memory_config",
 ]
 
@@ -267,4 +272,105 @@ test("cleanup unloads the plugin and closes the database", async () => {
   await cleanup()
   assert.ok(existsSync(join(root, ".opencode", "hw-memory.db")))
   rmSync(root, { recursive: true, force: true })
+})
+
+test("open items list with their age and can be verified without re-asserting them", async () => {
+  const { root, tools, cleanup } = await setup()
+  await tools.hw_memory_add.execute({
+    content: "unrelated serializer mismatch found while editing docs",
+    kind: "debt",
+    rank: "high",
+  })
+  await tools.hw_memory_add.execute({
+    content: "follow up on the flaky markdown export test",
+    kind: "reminder",
+  })
+
+  const debts = text(await tools.hw_memory_debt.execute({ action: "list" }))
+  assert.match(debts, /never checked/)
+  const id = Number(debts.match(/#(\d+)/)![1])
+  assert.match(text(await tools.hw_memory_debt.execute({ action: "verify", id })), /checked today/)
+  assert.match(text(await tools.hw_memory_debt.execute({ action: "list" })), /checked 0d ago/)
+
+  const reminders = text(await tools.hw_memory_reminder.execute({ action: "list" }))
+  assert.match(reminders, /flaky markdown export/)
+  const rid = Number(reminders.match(/#(\d+)/)![1])
+  assert.match(text(await tools.hw_memory_reminder.execute({ action: "resolve", id: rid })), /Resolved reminder/)
+  assert.equal(text(await tools.hw_memory_reminder.execute({ action: "list" })), "No open reminders.")
+
+  await cleanup()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("session.idle nudges undispositioned open items once and stops after a check", async () => {
+  const { root, tools, output, pushEvent, callHook, cleanup } = await setup()
+  await tools.hw_memory_add.execute({
+    content: "unrelated serializer mismatch found while editing docs",
+    kind: "debt",
+    rank: "high",
+  })
+
+  const nudges = () => output.synthetic.filter((s) => s.includes("open item(s) need a decision"))
+  const idle = async (sessionID: string) => {
+    pushEvent({ type: "session.idle", data: { sessionID } })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  }
+
+  await callHook("prompt", { sessionID: "s1", prompt: { text: "task finished" } })
+  await idle("s1")
+  assert.equal(nudges().length, 1)
+  assert.match(nudges()[0], /#\d+ \[high\/debt\]/)
+  assert.match(nudges()[0], /never checked/)
+  assert.match(nudges()[0], /action: verify/)
+
+  // an unaddressed item is not repeated within a day
+  await callHook("prompt", { sessionID: "s1", prompt: { text: "done" } })
+  await idle("s1")
+  assert.equal(nudges().length, 1)
+
+  // checking it today ends the nudges, even in another session
+  const list = text(await tools.hw_memory_debt.execute({ action: "list" }))
+  const id = Number(list.match(/#(\d+)/)![1])
+  await tools.hw_memory_debt.execute({ action: "verify", id })
+  await callHook("prompt", { sessionID: "s2", prompt: { text: "готово" } })
+  await idle("s2")
+  assert.equal(nudges().length, 1, "a checked item is not nudged again")
+
+  await cleanup()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("context hook surfaces only the open items related to the last prompt", async () => {
+  const { root, tools, hooks, callHook, cleanup } = await setup()
+  await tools.hw_memory_add.execute({
+    content: "serializer mismatch between the API contract and the export path",
+    kind: "debt",
+    rank: "high",
+  })
+  await tools.hw_memory_add.execute({
+    content: "the CI runner caches node modules too aggressively",
+    kind: "debt",
+    rank: "high",
+  })
+  await callHook("prompt", {
+    sessionID: "s1",
+    prompt: { text: "fix the serializer mismatch in the export path" },
+  })
+  const event = { sessionID: "s1", system: [] as { type: string; text: string }[] }
+  for (const hook of hooks.context) await hook(event)
+  const pack = event.system[0].text
+  assert.match(pack, /Possibly related to this task/)
+  const related = pack.split("## Possibly related")[1].split("## Open technical debt")[0]
+  assert.match(related, /serializer mismatch/)
+  assert.doesNotMatch(related, /CI runner/)
+  await cleanup()
+  rmSync(root, { recursive: true, force: true })
+})
+
+test("completion phrases need word boundaries in both scripts", () => {
+  assert.equal(isCompletionPhrase("all done, thanks"), true)
+  assert.equal(isCompletionPhrase("Task finished"), true)
+  assert.equal(isCompletionPhrase("the work is undone"), false, "substring inside a word must not trigger")
+  assert.equal(isCompletionPhrase("готово"), true)
+  assert.equal(isCompletionPhrase("посмотри на задачу"), false)
 })

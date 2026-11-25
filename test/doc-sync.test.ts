@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import type { DB } from "../src/db.ts"
 import { openDBFile } from "../src/db.ts"
-import { addFact, initSchema, markObsolete } from "../src/core.ts"
+import { addFact, initSchema, markObsolete, resolveFact } from "../src/core.ts"
 import { contentHash } from "../src/util.ts"
 import {
   applyDocs,
@@ -20,6 +20,7 @@ import {
 const DECISIONS = "docs/hw-memory/decisions.md"
 const GOTCHAS = "docs/hw-memory/gotchas.md"
 const DEBT = "docs/hw-memory/debt.md"
+const REMINDERS = "docs/hw-memory/reminders.md"
 
 interface Fixture {
   root: string
@@ -384,6 +385,24 @@ test("applyDocs keeps a user-edited line and marks its manifest row as user-owne
 
     applyDocs(f.db, f.root)
     assert.ok(read(f.root, GOTCHAS).includes(content), "user-owned lines stay on later applies")
+  } finally {
+    f.cleanup()
+  }
+})
+
+test("a resolved reminder loses its doc line like any other obsolete fact", async () => {
+  const f = await fixture()
+  try {
+    const content = "Follow up on the flaky markdown export test"
+    const fact = addFact(f.db, { content, kind: "reminder", rank: "medium", source: "agent" })
+    queueDocUpdate(f.db, { id: fact.id, kind: "reminder", content, origin: null })
+    applyDocs(f.db, f.root)
+    assert.ok(read(f.root, REMINDERS).includes(content))
+
+    resolveFact(f.db, fact.id)
+    assert.equal(planDocs(f.db, f.root).removals.length, 1)
+    applyDocs(f.db, f.root)
+    assert.ok(!read(f.root, REMINDERS).includes(content))
   } finally {
     f.cleanup()
   }

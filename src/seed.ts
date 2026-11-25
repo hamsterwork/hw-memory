@@ -470,6 +470,7 @@ function toFact(r: any): FactRow {
     scope: (r.scope ?? null) as string | null,
     obsolete_at: (r.obsolete_at ?? null) as string | null,
     last_verified_at: (r.last_verified_at ?? null) as string | null,
+    last_checked_at: (r.last_checked_at ?? null) as string | null,
     created_at: r.created_at as string,
     last_accessed_at: (r.last_accessed_at ?? null) as string | null,
   }

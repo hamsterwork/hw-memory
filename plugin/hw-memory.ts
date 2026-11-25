@@ -12730,6 +12730,41 @@ var RANK_TABLE = {
   low: { init: 0.6, rate: BASE_RATE * 2, prunable: true }
 };
 var RANK_ORDER = { critical: 3, high: 2, medium: 1, low: 0 };
+var GENERIC_TASK_TOKENS = /* @__PURE__ */ new Set([
+  "debt",
+  "debts",
+  "reminder",
+  "reminders",
+  "remind",
+  "technical",
+  "todo",
+  "task",
+  "tasks",
+  "memory",
+  "memories",
+  "agent",
+  "project",
+  "issue",
+  "issues",
+  "problem",
+  "problems",
+  "need",
+  "needs",
+  "want",
+  "wants",
+  "make",
+  "let",
+  "check",
+  "checks",
+  "work",
+  "works",
+  "\u0434\u043E\u043B\u0433",
+  "\u0434\u043E\u043B\u0433\u0438",
+  "\u043D\u0430\u043F\u043E\u043C\u0438\u043D\u0430\u043D\u0438\u0435",
+  "\u043D\u0430\u043F\u043E\u043C\u0438\u043D\u0430\u043D\u0438\u044F",
+  "\u0437\u0430\u0434\u0430\u0447\u0430",
+  "\u0437\u0430\u0434\u0430\u0447\u0438"
+]);
 function isCrucial(kind, rank) {
   return kind === "decision" || kind === "gotcha" || kind === "debt" || kind === "changelog" || kind === "reminder" || rank === "critical" || rank === "high";
 }
@@ -12773,7 +12808,7 @@ function ensureColumn(db, table, name, sql) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all();
   if (!cols.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${sql}`);
 }
-var SCHEMA_VERSION = 1;
+var SCHEMA_VERSION = 2;
 function initSchema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS memories (
@@ -12788,6 +12823,7 @@ function initSchema(db) {
       source TEXT NOT NULL DEFAULT 'auto',
       origin TEXT DEFAULT NULL,
       last_verified_at TEXT DEFAULT NULL,
+      last_checked_at TEXT DEFAULT NULL,
       created_at TEXT NOT NULL,
       last_accessed_at TEXT DEFAULT NULL
     );
@@ -12869,6 +12905,7 @@ function initSchema(db) {
   `);
   ensureColumn(db, "memories", "scope", "scope TEXT DEFAULT NULL");
   ensureColumn(db, "memories", "obsolete_at", "obsolete_at TEXT DEFAULT NULL");
+  ensureColumn(db, "memories", "last_checked_at", "last_checked_at TEXT DEFAULT NULL");
   ensureColumn(db, "seed_scopes", "line_hashes", "line_hashes TEXT NOT NULL DEFAULT ''");
   ensureFileTargets(db);
   normalizeSeedOrigins(db);
@@ -12907,6 +12944,7 @@ function rowToFact(r) {
     scope: r.scope ?? null,
     obsolete_at: r.obsolete_at ?? null,
     last_verified_at: r.last_verified_at ?? null,
+    last_checked_at: r.last_checked_at ?? null,
     created_at: r.created_at,
     last_accessed_at: r.last_accessed_at ?? null
   };
@@ -13023,6 +13061,32 @@ function searchFacts(db, query, opts = {}) {
   }
   return top;
 }
+function taskTokens(text) {
+  const out = /* @__PURE__ */ new Set();
+  for (const t of tokenize(text)) {
+    if (t.length < 4 || STOPWORDS.has(t) || GENERIC_TASK_TOKENS.has(t)) continue;
+    out.add(t);
+  }
+  return out;
+}
+function findRelatedItems(db, task, opts = {}) {
+  const want = taskTokens(task);
+  const minShared = opts.minShared ?? 2;
+  if (want.size < minShared) return [];
+  const kinds = opts.kinds ?? ["debt", "reminder"];
+  const rows = db.prepare(
+    `SELECT * FROM memories WHERE obsolete_at IS NULL AND kind IN (${kinds.map(() => "?").join(",")})`
+  ).all(...kinds).map(rowToFact);
+  const scored = [];
+  for (const fact of rows) {
+    const hay = tokenSet(`${fact.content} ${fact.keywords}`);
+    let shared = 0;
+    for (const t of want) if (hay.has(t)) shared++;
+    if (shared >= minShared) scored.push({ fact, shared });
+  }
+  scored.sort((a, b) => b.shared - a.shared || b.fact.weight - a.fact.weight || a.fact.id - b.fact.id);
+  return scored.slice(0, opts.limit ?? 3).map((s) => s.fact);
+}
 var lastMaintain = /* @__PURE__ */ new WeakMap();
 var emptyMaintain = (db) => ({
   decayed: 0,
@@ -13114,7 +13178,7 @@ function listFactsByKind(db, kind) {
   return db.prepare("SELECT * FROM memories WHERE kind = ? ORDER BY weight DESC, created_at DESC").all(kind).map(rowToFact);
 }
 function listReminders(db) {
-  return listFactsByKind(db, "reminder");
+  return db.prepare("SELECT * FROM memories WHERE kind = 'reminder' AND obsolete_at IS NULL ORDER BY weight DESC, created_at DESC").all().map(rowToFact);
 }
 function listChangelog(db) {
   return listFactsByKind(db, "changelog");
@@ -13146,6 +13210,44 @@ function listDebt(db) {
 function countDebt(db) {
   return db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'debt' AND obsolete_at IS NULL").get().c;
 }
+function countReminders(db) {
+  return db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'reminder' AND obsolete_at IS NULL").get().c;
+}
+function countOpenItems(db) {
+  return db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind IN ('debt','reminder') AND obsolete_at IS NULL").get().c;
+}
+function listStaleOpenItems(db, opts = {}) {
+  const staleDays = opts.staleDays ?? 0;
+  const rows = db.prepare(
+    `SELECT * FROM memories WHERE kind IN ('debt','reminder') AND obsolete_at IS NULL
+       ORDER BY created_at ASC, id ASC`
+  ).all().map(rowToFact);
+  const due = rows.filter((f) => {
+    if (staleDays <= 0) return !f.last_checked_at || daysSince(f.last_checked_at) >= 1;
+    return daysSince(f.last_checked_at ?? f.created_at) >= staleDays;
+  });
+  return due.slice(0, opts.limit ?? 10);
+}
+function factAgeLabel(fact) {
+  const open = Math.max(0, Math.floor(daysSince(fact.created_at)));
+  const checked = fact.last_checked_at ?? fact.last_verified_at;
+  if (!checked) return `open ${open}d, never checked`;
+  return `open ${open}d, checked ${Math.max(0, Math.floor(daysSince(checked)))}d ago`;
+}
+function resolveFact(db, id) {
+  const fact = getFact(db, id);
+  if (!fact || fact.obsolete_at) return null;
+  if (fact.kind !== "debt" && fact.kind !== "reminder") return null;
+  markObsolete(db, id);
+  return getFact(db, id);
+}
+function verifyFact(db, id) {
+  const fact = getFact(db, id);
+  if (!fact || fact.obsolete_at) return null;
+  if (fact.kind !== "debt" && fact.kind !== "reminder") return null;
+  db.prepare("UPDATE memories SET last_checked_at = ? WHERE id = ?").run(nowISO(), id);
+  return getFact(db, id);
+}
 function resolveDebt(db, id) {
   const fact = getFact(db, id);
   if (!fact || fact.kind !== "debt" || fact.obsolete_at) return null;
@@ -13173,42 +13275,68 @@ function statsFacts(db) {
     bySource,
     avgWeight: rows.length ? weightSum / rows.length : 0,
     oldest,
-    debt: countDebt(db)
+    debt: countDebt(db),
+    reminders: countReminders(db)
   };
 }
-function wakeUpPack(db, charBudget = 2500) {
+function factLine(f, withId = false) {
+  return `- ${withId ? `#${f.id} ` : ""}[${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`;
+}
+function wakeUpPack(db, charBudget = 2500, task = "") {
   const crucial = db.prepare("SELECT * FROM memories WHERE rank IN ('critical','high') ORDER BY weight DESC LIMIT 12").all().map(rowToFact);
   const medium = db.prepare("SELECT * FROM memories WHERE rank = 'medium' ORDER BY weight DESC LIMIT 5").all().map(rowToFact);
+  const debtRows = listDebt(db);
+  const reminderRows = listReminders(db);
+  const related = task.trim() ? findRelatedItems(db, task, { limit: 3 }) : [];
+  const relatedIds = new Set(related.map((f) => f.id));
   const lines = ["## hw-memory \u2014 persistent project memory (top facts)"];
-  const debtTotal = countDebt(db);
-  const reminderTotal = db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'reminder'").get().c;
-  if (crucial.length === 0 && medium.length === 0 && debtTotal === 0 && reminderTotal === 0) {
+  if (crucial.length === 0 && medium.length === 0 && debtRows.length === 0 && reminderRows.length === 0) {
     lines.push("Memory DB is empty. Suggest the user run /hw-seed <path> to import notes or docs.");
   }
   let used = lines.join("\n").length;
-  const push = (f) => {
-    const line = `- [${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`;
-    if (used + line.length > charBudget) return false;
+  const push = (line) => {
+    if (used + line.length + 1 > charBudget) return false;
     lines.push(line);
-    used += line.length;
+    used += line.length + 1;
     return true;
   };
   for (const f of [...crucial, ...medium]) {
-    if (!push(f)) break;
+    if (!push(factLine(f))) break;
   }
-  if (debtTotal > 0) {
-    lines.push("", `## Open technical debt (${debtTotal}) \u2014 tell the user about new items before finishing`);
-    for (const f of listDebt(db).slice(0, 5)) {
-      if (!push(f)) break;
+  const section = (title, rows, total, more) => {
+    if (rows.length === 0) return;
+    if (used + title.length + 2 > charBudget) return;
+    push("");
+    push(title);
+    let shown = 0;
+    for (const f of rows) {
+      if (!push(factLine(f, true))) break;
+      shown++;
     }
-  }
-  if (reminderTotal > 0) {
-    lines.push("", `## Open reminders (${reminderTotal})`);
-    for (const f of listReminders(db).slice(0, 5)) {
-      if (!push(f)) break;
-    }
-  }
-  lines.push("", "Use hw_memory_search tool to recall more.");
+    if (shown < total) push(`- \u2026and ${total - shown} more (${more})`);
+  };
+  section(
+    "## Possibly related to this task \u2014 verify or resolve when done",
+    related,
+    related.length,
+    "see the open-item lists"
+  );
+  const openDebt = debtRows.filter((f) => !relatedIds.has(f.id));
+  const openReminders = reminderRows.filter((f) => !relatedIds.has(f.id));
+  section(
+    `## Open technical debt (${debtRows.length}) \u2014 tell the user about new items before finishing`,
+    openDebt.slice(0, 5),
+    openDebt.length,
+    "see /hw-debts"
+  );
+  section(
+    `## Open reminders (${reminderRows.length}) \u2014 resolve when done`,
+    openReminders.slice(0, 5),
+    openReminders.length,
+    "see /hw-reminders"
+  );
+  push("");
+  push("Use hw_memory_search tool to recall more.");
   return lines.join("\n");
 }
 
@@ -13899,6 +14027,7 @@ function toFact(r) {
     scope: r.scope ?? null,
     obsolete_at: r.obsolete_at ?? null,
     last_verified_at: r.last_verified_at ?? null,
+    last_checked_at: r.last_checked_at ?? null,
     created_at: r.created_at,
     last_accessed_at: r.last_accessed_at ?? null
   };
@@ -14501,9 +14630,11 @@ function listCheckpoints(db) {
 }
 
 // src/ops.ts
-function formatFacts(rows) {
-  if (rows.length === 0) return "No memories found.";
-  return rows.map((f) => `#${f.id} [${f.rank}/${f.kind}] ${f.content}${f.obsolete_at ? " (obsolete)" : ""}`).join("\n");
+function formatOpenItems(rows) {
+  if (rows.length === 0) return "None.";
+  return rows.map(
+    (f) => `#${f.id} [${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""} \u2014 ${factAgeLabel(f)}`
+  ).join("\n");
 }
 function seedOperation(db, root, args) {
   if (args.flags["--changed"]) {
@@ -14588,11 +14719,11 @@ function dashboardOperation(db, root, args) {
   const lines = [
     `## hw-memory dashboard (${countFacts(db)} facts)`,
     "",
-    `### Top debts (${debts.length})`,
-    formatFacts(debts),
+    `### Top debts (${debts.length}/${countDebt(db)} open)`,
+    formatOpenItems(debts),
     "",
-    `### Top reminders (${reminders.length})`,
-    formatFacts(reminders)
+    `### Top reminders (${reminders.length}/${countReminders(db)} open)`,
+    formatOpenItems(reminders)
   ];
   if (prunes.length > 0) {
     lines.push("", "### Proposed medium-rank prunes (require approval)");
@@ -14616,11 +14747,11 @@ function dashboardOperation(db, root, args) {
 }
 function debtsOperation(db) {
   const rows = listDebt(db);
-  return rows.length === 0 ? "No open technical debt." : formatFacts(rows);
+  return rows.length === 0 ? "No open technical debt." : formatOpenItems(rows);
 }
 function remindersOperation(db) {
   const rows = listReminders(db);
-  return rows.length === 0 ? "No reminders." : formatFacts(rows);
+  return rows.length === 0 ? "No reminders." : formatOpenItems(rows);
 }
 
 // src/commands.ts
@@ -14818,9 +14949,12 @@ function defineTextTool(spec) {
     execute: async (input) => ({ content: await spec.run(spec.schema.parse(input)) })
   };
 }
-function formatFacts2(rows) {
+function formatFacts(rows) {
   if (rows.length === 0) return "No memories found.";
   return rows.map((f) => `#${f.id} [${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`).join("\n");
+}
+function formatOpenRows(rows) {
+  return rows.map((f) => `#${f.id} [${f.rank}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""} \u2014 ${factAgeLabel(f)}`).join("\n");
 }
 function makeTools(root, db) {
   const memoryAdd = defineTextTool({
@@ -14848,8 +14982,8 @@ function makeTools(root, db) {
           note = " Doc update proposed \u2014 run /hw-docs to review.";
         }
       }
-      const debtNote = res.kind === "debt" ? " \u26A0 Technical debt recorded \u2014 tell the user about it before finishing the task." : "";
-      return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}${debtNote}`;
+      const openNote = res.kind === "debt" ? " \u26A0 Technical debt recorded \u2014 tell the user about it before finishing the task." : res.kind === "reminder" ? " Open item recorded \u2014 verify or resolve it before finishing the task." : "";
+      return `${res.status === "inserted" ? "Stored" : "Updated (duplicate)"} #${res.id} [${res.rank}/${res.kind}]${note}${openNote}`;
     }
   });
   const memorySearch = defineTextTool({
@@ -14862,7 +14996,7 @@ function makeTools(root, db) {
     async run(args) {
       maintain(db);
       const hits = searchFacts(db, args.query, { limit: args.limit ?? 5 });
-      return formatFacts2(hits);
+      return formatFacts(hits);
     }
   });
   const memoryStats = defineTextTool({
@@ -14895,13 +15029,19 @@ function makeTools(root, db) {
     }
   });
   const memoryDebt = defineTextTool({
-    description: "Technical debt found while working on other tasks. action=list (default) lists open debt; action=resolve with id marks it resolved (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
+    description: "Technical debt found while working on other tasks. action=list (default) lists open debt with its age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
     name: "hw_memory_debt",
     schema: external_exports.object({
-      action: external_exports.enum(["list", "resolve"]).optional().describe("list (default) or resolve."),
-      id: external_exports.number().optional().describe("Debt id to resolve.")
+      action: external_exports.enum(["list", "verify", "resolve"]).optional().describe("list (default), verify or resolve."),
+      id: external_exports.number().optional().describe("Debt id for verify/resolve.")
     }),
     async run(args) {
+      if (args.action === "verify") {
+        if (args.id == null) return "Provide the debt id to verify.";
+        const fact = verifyFact(db, args.id);
+        if (!fact || fact.kind !== "debt") return `#${args.id} is not an open debt item.`;
+        return `Verified debt #${args.id} (still open, checked today). Weight and decay clock unchanged.`;
+      }
       if (args.action === "resolve") {
         if (args.id == null) return "Provide the debt id to resolve.";
         const fact = resolveDebt(db, args.id);
@@ -14910,7 +15050,32 @@ function makeTools(root, db) {
       }
       const rows = listDebt(db);
       if (rows.length === 0) return "No open technical debt.";
-      return rows.map((f) => `#${f.id} [${f.rank}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`).join("\n");
+      return formatOpenRows(rows);
+    }
+  });
+  const memoryReminder = defineTextTool({
+    description: "Reminders are plans, open questions and follow-ups. action=list (default) lists open reminders with their age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (it leaves the lists; its managed-doc line, if any, is removed on /hw-docs --apply). Dispose of reminders a task touches before finishing it.",
+    name: "hw_memory_reminder",
+    schema: external_exports.object({
+      action: external_exports.enum(["list", "verify", "resolve"]).optional().describe("list (default), verify or resolve."),
+      id: external_exports.number().optional().describe("Reminder id for verify/resolve.")
+    }),
+    async run(args) {
+      if (args.action === "verify") {
+        if (args.id == null) return "Provide the reminder id to verify.";
+        const fact = verifyFact(db, args.id);
+        if (!fact || fact.kind !== "reminder") return `#${args.id} is not an open reminder.`;
+        return `Verified reminder #${args.id} (still open, checked today). Weight and decay clock unchanged.`;
+      }
+      if (args.action === "resolve") {
+        if (args.id == null) return "Provide the reminder id to resolve.";
+        const fact = resolveFact(db, args.id);
+        if (!fact || fact.kind !== "reminder") return `#${args.id} is not an open reminder.`;
+        return `Resolved reminder #${args.id}. Its managed-doc line, if any, is removed on /hw-docs --apply.`;
+      }
+      const rows = listReminders(db);
+      if (rows.length === 0) return "No open reminders.";
+      return formatOpenRows(rows);
     }
   });
   const memoryConfig = defineTextTool({
@@ -14944,7 +15109,7 @@ function makeTools(root, db) {
       return `${t.kind}: ${t.enabled ? "enabled" : "disabled"} -> ${t.path}`;
     }
   });
-  return [memoryAdd, memorySearch, memoryStats, memoryForget, memoryDebt, memoryConfig];
+  return [memoryAdd, memorySearch, memoryStats, memoryForget, memoryDebt, memoryReminder, memoryConfig];
 }
 function registerTools(editor, root, db) {
   for (const tool of makeTools(root, db)) editor.add(tool);
@@ -14967,6 +15132,15 @@ function resultText(content) {
   if (!Array.isArray(content)) return "";
   return content.filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n");
 }
+var COMPLETION_ASCII = /(?<![a-z])(task finished|finished the task|task complete|task done|done)(?![a-z])/i;
+var COMPLETION_CYRILLIC = /(готово|завершено|выполнено|сделано)/i;
+function isCompletionPhrase(text) {
+  return COMPLETION_ASCII.test(text) || COMPLETION_CYRILLIC.test(text);
+}
+var NUDGE_REPEAT_MS = 24 * 60 * 60 * 1e3;
+var NUDGE_BACKGROUND_MS = 6 * 60 * 60 * 1e3;
+var NUDGE_STALE_DAYS = 7;
+var NUDGE_LIMIT = 5;
 var HwMemoryPlugin = {
   id: "hw-memory",
   async setup(ctx) {
@@ -14976,7 +15150,10 @@ var HwMemoryPlugin = {
     const tracker = new SessionTracker();
     const controller = new AbortController();
     const forceScan = /* @__PURE__ */ new Set();
+    const taskText = /* @__PURE__ */ new Map();
+    const nudgedAt = /* @__PURE__ */ new Map();
     let lastScan = 0;
+    let lastNudge = Date.now();
     const storeCandidate = (sessionID, candidate, origin) => {
       addFact(db, {
         content: candidate.content,
@@ -14993,24 +15170,30 @@ var HwMemoryPlugin = {
       db.prepare("UPDATE memories SET kind = 'gotcha', rank = 'high', weight = 1.0, last_verified_at = ? WHERE id = ?").run((/* @__PURE__ */ new Date()).toISOString(), id);
       queueDocUpdate(db, { id, kind: "gotcha", content: fact.content, origin: fact.origin }, void 0, void 0, "error promoted to gotcha");
     };
-    const pack = () => {
+    const pack = (sessionID) => {
       maintain(db);
-      return wakeUpPack(db);
+      return wakeUpPack(db, 2500, sessionID ? taskText.get(sessionID) ?? "" : "");
+    };
+    const forgetSession = (sessionID) => {
+      tracker.clear(sessionID);
+      taskText.delete(sessionID);
+      for (const key of nudgedAt.keys()) if (key.startsWith(`${sessionID}:`)) nudgedAt.delete(key);
     };
     await ctx.tool.transform((editor) => registerTools(editor, root, db));
     await registerCommands(ctx, db, root);
     await ctx.session.hook("prompt", (event) => {
       try {
-        const text = String(event?.prompt?.text ?? "").toLowerCase();
-        if (/(task finished|finished the task|task complete|done|готово|завершено)/.test(text)) {
-          forceScan.add(event.sessionID);
-        }
+        const text = String(event?.prompt?.text ?? "");
+        const sessionID = String(event?.sessionID ?? "");
+        if (!sessionID) return;
+        if (isCompletionPhrase(text)) forceScan.add(sessionID);
+        if (text.trim()) taskText.set(sessionID, text);
       } catch {
       }
     });
     await ctx.session.hook("context", (event) => {
       try {
-        event.system.push({ type: "text", text: pack() });
+        event.system.push({ type: "text", text: pack(event.sessionID) });
       } catch (e) {
         console.error("hw-memory wake-up failed:", e);
       }
@@ -15069,6 +15252,26 @@ var HwMemoryPlugin = {
         console.error("hw-memory extraction failed:", e);
       }
     });
+    const nudgeOpenItems = async (sessionID, forced) => {
+      const now = Date.now();
+      if (!forced && now - lastNudge < NUDGE_BACKGROUND_MS) return;
+      const candidates = listStaleOpenItems(db, { staleDays: forced ? 0 : NUDGE_STALE_DAYS, limit: 30 });
+      const due = candidates.filter((f) => {
+        const at = nudgedAt.get(`${sessionID}:${f.id}`);
+        return at === void 0 || now - at >= NUDGE_REPEAT_MS;
+      }).slice(0, NUDGE_LIMIT);
+      if (due.length === 0) return;
+      lastNudge = now;
+      for (const f of due) nudgedAt.set(`${sessionID}:${f.id}`, now);
+      const open = countOpenItems(db);
+      const lines = [
+        `## hw-memory: ${due.length} open item(s) need a decision${forced ? "" : " (stale check)"}`,
+        "Tell the user, then dispose of each: `hw_memory_debt` / `hw_memory_reminder` with `action: verify` (still open) or `action: resolve` (done).",
+        ...due.map((f) => `- #${f.id} [${f.rank}/${f.kind}] ${f.content} \u2014 ${factAgeLabel(f)}`)
+      ];
+      if (open > due.length) lines.push(`Full lists: /hw-debts and /hw-reminders (${open} open items).`);
+      await ctx.session.synthetic({ sessionID, text: lines.join("\n") });
+    };
     const onSessionIdle = async (sessionID) => {
       try {
         const messages = await ctx.session.context({ sessionID });
@@ -15076,27 +15279,34 @@ var HwMemoryPlugin = {
       } catch (e) {
         console.error("hw-memory assistant extraction failed:", e);
       }
+      const forced = forceScan.delete(sessionID);
       try {
-        const forced = forceScan.delete(sessionID);
-        if (!forced && Date.now() - lastScan < 36e5) return;
-        lastScan = Date.now();
-        const drift = scanDrift(db, root, { force: true });
-        if (drift.length === 0) return;
-        const lines = drift.map(
-          (d) => `- ${d.path}: +${d.added} -${d.removed} ~${d.changed}${d.agentAttributed ? " (agent edit)" : ""}`
-        );
-        await ctx.session.synthetic({
-          sessionID,
-          text: ["## hw-memory: seeded files changed", ...lines, "", "Run /hw-seed <path> to review."].join("\n")
-        });
+        if (forced || Date.now() - lastScan >= 36e5) {
+          lastScan = Date.now();
+          const drift = scanDrift(db, root, { force: true });
+          if (drift.length > 0) {
+            const lines = drift.map(
+              (d) => `- ${d.path}: +${d.added} -${d.removed} ~${d.changed}${d.agentAttributed ? " (agent edit)" : ""}`
+            );
+            await ctx.session.synthetic({
+              sessionID,
+              text: ["## hw-memory: seeded files changed", ...lines, "", "Run /hw-seed <path> to review."].join("\n")
+            });
+          }
+        }
       } catch (e) {
         console.error("hw-memory drift scan failed:", e);
+      }
+      try {
+        await nudgeOpenItems(sessionID, forced);
+      } catch (e) {
+        console.error("hw-memory open-item check failed:", e);
       }
     };
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          if (event.type === "session.deleted") tracker.clear(event.data.sessionID);
+          if (event.type === "session.deleted") forgetSession(event.data.sessionID);
           else if (event.type === "session.idle") await onSessionIdle(event.data.sessionID);
         }
       } catch (e) {
@@ -15113,5 +15323,6 @@ var hw_memory_default = HwMemoryPlugin;
 export {
   HwMemoryPlugin,
   hw_memory_default as default,
-  extractSessionDecisions
+  extractSessionDecisions,
+  isCompletionPhrase
 };

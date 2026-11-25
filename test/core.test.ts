@@ -12,6 +12,9 @@ import {
   computeWeight,
   countDebt,
   countFacts,
+  countReminders,
+  factAgeLabel,
+  findRelatedItems,
   findSimilar,
   forgetFact,
   forgetKind,
@@ -23,14 +26,17 @@ import {
   listDebt,
   listPendingPrunes,
   listReminders,
+  listStaleOpenItems,
   maintain,
   markObsolete,
   promoteRank,
   resolveDebt,
+  resolveFact,
   resolvePrune,
   searchFacts,
   setRank,
   statsFacts,
+  verifyFact,
   wakeUpPack,
 } from "../src/core.ts"
 
@@ -480,4 +486,91 @@ test("initSchema normalizes legacy duplicate seed origins and enforces the uniqu
   assert.throws(() => insert("another duplicate", "h-gamma", "medium", 0))
   dbx.close()
   rmSync(root, { recursive: true, force: true })
+})
+
+test("verify stamps the check date without touching weight or the decay clock", async () => {
+  await withTempDB((tdb) => {
+    const res = addFact(tdb, {
+      content: "stale serializer mismatch in the export path",
+      kind: "debt",
+      rank: "high",
+    })
+    const before = getFact(tdb, res.id)!
+    assert.equal(before.last_checked_at, null)
+    assert.match(factAgeLabel(before), /never checked/)
+
+    const verified = verifyFact(tdb, res.id)!
+    assert.ok(verified.last_checked_at)
+    assert.equal(verified.last_verified_at, null, "verifying must not re-assert the fact")
+    assert.equal(verified.weight, before.weight, "verifying never re-weights")
+    assert.match(factAgeLabel(verified), /checked 0d ago/)
+
+    assert.deepEqual(
+      listStaleOpenItems(tdb, { staleDays: 0 }).map((f) => f.id),
+      [],
+      "a check today clears the item from the finish-time queue",
+    )
+  })
+})
+
+test("reminders resolve like debt and leave a tombstone for doc removal", async () => {
+  await withTempDB((tdb) => {
+    const res = addFact(tdb, { content: "follow up on the flaky markdown export test", kind: "reminder" })
+    assert.equal(countReminders(tdb), 1)
+    assert.ok(listReminders(tdb).some((f) => f.id === res.id))
+
+    const resolved = resolveFact(tdb, res.id)
+    assert.ok(resolved?.obsolete_at)
+    assert.equal(countReminders(tdb), 0)
+    assert.ok(!listReminders(tdb).some((f) => f.id === res.id), "resolved reminders leave the list")
+    assert.ok(getFact(tdb, res.id), "tombstone kept so /hw-docs can remove its exact line")
+    assert.equal(resolveFact(tdb, res.id), null, "resolving twice is a no-op")
+
+    const plain = addFact(tdb, { content: "a plain durable fact", kind: "fact" })
+    assert.equal(resolveFact(tdb, plain.id), null, "only open items resolve")
+    assert.equal(verifyFact(tdb, plain.id), null, "only open items verify")
+  })
+})
+
+test("task relevance needs two significant shares and never bumps accesses", async () => {
+  await withTempDB((tdb) => {
+    const hit = addFact(tdb, {
+      content: "serializer mismatch between the API contract and the export path",
+      kind: "debt",
+      rank: "high",
+    })
+    const miss = addFact(tdb, {
+      content: "the CI runner caches node modules too aggressively",
+      kind: "debt",
+      rank: "high",
+    })
+    assert.deepEqual(findRelatedItems(tdb, "check the open debt", { limit: 5 }), [], "category words alone never match")
+
+    const related = findRelatedItems(tdb, "fix the serializer mismatch in the export path", { limit: 5 })
+    assert.deepEqual(related.map((f) => f.id), [hit.id])
+    assert.ok(!related.some((f) => f.id === miss.id))
+
+    const accesses = getFact(tdb, hit.id)!.accesses
+    findRelatedItems(tdb, "serializer mismatch again", { limit: 5 })
+    assert.equal(getFact(tdb, hit.id)!.accesses, accesses, "relevance lookup is read-only")
+  })
+})
+
+test("wakeUpPack surfaces a related item once and admits truncation", async () => {
+  await withTempDB((tdb) => {
+    const subjects = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+    for (const s of subjects) {
+      addFact(tdb, { content: `background ${s} debt inside the widget subsystem`, kind: "debt", rank: "medium" })
+    }
+    const related = addFact(tdb, {
+      content: "the widget serializer drops trailing separators",
+      kind: "debt",
+      rank: "low",
+    })
+    const pack = wakeUpPack(tdb, 2500, "fix the widget serializer separators bug")
+    assert.match(pack, /Possibly related to this task/)
+    assert.equal(pack.split(`#${related.id} `).length - 1, 1, "a related item is listed exactly once")
+    assert.match(pack, /…and \d+ more \(see \/hw-debts\)/, "truncation is stated, not silent")
+    assert.ok(pack.length < 3000)
+  })
 })

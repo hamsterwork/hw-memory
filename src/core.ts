@@ -1,6 +1,6 @@
 import type { DB } from "./db.ts"
 import { DEFAULT_CAP_ROWS, ensureFileTargets, getCapRows } from "./config.ts"
-import { contentHash, daysSince, ftsQuery, nowISO, similarityScore, tokenSet } from "./util.ts"
+import { contentHash, daysSince, ftsQuery, nowISO, similarityScore, STOPWORDS, tokenSet, tokenize } from "./util.ts"
 
 export type Rank = "critical" | "high" | "medium" | "low"
 export type Kind =
@@ -27,6 +27,17 @@ export const RANK_TABLE: Record<Rank, { init: number; rate: number; prunable: bo
 
 export const RANK_ORDER: Record<Rank, number> = { critical: 3, high: 2, medium: 1, low: 0 }
 
+/**
+ * Words that describe the *category* of an open item rather than its subject, so
+ * they never create task relevance on their own.
+ */
+const GENERIC_TASK_TOKENS = new Set([
+  "debt", "debts", "reminder", "reminders", "remind", "technical", "todo", "task", "tasks",
+  "memory", "memories", "agent", "project", "issue", "issues", "problem", "problems",
+  "need", "needs", "want", "wants", "make", "let", "check", "checks", "work", "works",
+  "долг", "долги", "напоминание", "напоминания", "задача", "задачи",
+])
+
 export interface FactRow {
   id: number
   content: string
@@ -41,6 +52,8 @@ export interface FactRow {
   scope: string | null
   obsolete_at: string | null
   last_verified_at: string | null
+  /** Last disposition check (see `verifyFact`). Reporting only — it never resets decay. */
+  last_checked_at: string | null
   created_at: string
   last_accessed_at: string | null
 }
@@ -132,7 +145,7 @@ function ensureColumn(db: DB, table: string, name: string, sql: string): void {
   if (!cols.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${sql}`)
 }
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 
 export function initSchema(db: DB): void {
   db.exec(`
@@ -148,6 +161,7 @@ export function initSchema(db: DB): void {
       source TEXT NOT NULL DEFAULT 'auto',
       origin TEXT DEFAULT NULL,
       last_verified_at TEXT DEFAULT NULL,
+      last_checked_at TEXT DEFAULT NULL,
       created_at TEXT NOT NULL,
       last_accessed_at TEXT DEFAULT NULL
     );
@@ -230,6 +244,7 @@ export function initSchema(db: DB): void {
 
   ensureColumn(db, "memories", "scope", "scope TEXT DEFAULT NULL")
   ensureColumn(db, "memories", "obsolete_at", "obsolete_at TEXT DEFAULT NULL")
+  ensureColumn(db, "memories", "last_checked_at", "last_checked_at TEXT DEFAULT NULL")
   ensureColumn(db, "seed_scopes", "line_hashes", "line_hashes TEXT NOT NULL DEFAULT ''")
   ensureFileTargets(db)
   normalizeSeedOrigins(db)
@@ -271,6 +286,7 @@ function rowToFact(r: any): FactRow {
     scope: (r.scope ?? null) as string | null,
     obsolete_at: (r.obsolete_at ?? null) as string | null,
     last_verified_at: (r.last_verified_at ?? null) as string | null,
+    last_checked_at: (r.last_checked_at ?? null) as string | null,
     created_at: r.created_at as string,
     last_accessed_at: (r.last_accessed_at ?? null) as string | null,
   }
@@ -416,6 +432,47 @@ export function searchFacts(db: DB, query: string, opts: SearchOptions = {}): Sc
   return top
 }
 
+/** Significant task words: no stopwords, no item-category words, no fragments. */
+function taskTokens(text: string): Set<string> {
+  const out = new Set<string>()
+  for (const t of tokenize(text)) {
+    if (t.length < 4 || STOPWORDS.has(t) || GENERIC_TASK_TOKENS.has(t)) continue
+    out.add(t)
+  }
+  return out
+}
+
+/**
+ * Read-only relevance match: which open items touch this task text. A candidate
+ * qualifies only when it shares at least `minShared` significant words, so a
+ * passing mention of "debt" never surfaces an unrelated item. Unlike
+ * `searchFacts`, this never bumps accesses or weight.
+ */
+export function findRelatedItems(
+  db: DB,
+  task: string,
+  opts: { kinds?: Kind[]; limit?: number; minShared?: number } = {},
+): FactRow[] {
+  const want = taskTokens(task)
+  const minShared = opts.minShared ?? 2
+  if (want.size < minShared) return []
+  const kinds = opts.kinds ?? ["debt", "reminder"]
+  const rows = (db
+    .prepare(
+      `SELECT * FROM memories WHERE obsolete_at IS NULL AND kind IN (${kinds.map(() => "?").join(",")})`,
+    )
+    .all(...kinds) as any[]).map(rowToFact)
+  const scored: { fact: FactRow; shared: number }[] = []
+  for (const fact of rows) {
+    const hay = tokenSet(`${fact.content} ${fact.keywords}`)
+    let shared = 0
+    for (const t of want) if (hay.has(t)) shared++
+    if (shared >= minShared) scored.push({ fact, shared })
+  }
+  scored.sort((a, b) => b.shared - a.shared || b.fact.weight - a.fact.weight || a.fact.id - b.fact.id)
+  return scored.slice(0, opts.limit ?? 3).map((s) => s.fact)
+}
+
 export interface MaintainReport {
   decayed: number
   pruned: number
@@ -532,8 +589,11 @@ export function listFactsByKind(db: DB, kind: Kind): FactRow[] {
     .all(kind) as any[]).map(rowToFact)
 }
 
+/** Open reminders only: resolved ones stay as tombstones for `/hw-docs` line removal. */
 export function listReminders(db: DB): FactRow[] {
-  return listFactsByKind(db, "reminder")
+  return (db
+    .prepare("SELECT * FROM memories WHERE kind = 'reminder' AND obsolete_at IS NULL ORDER BY weight DESC, created_at DESC")
+    .all() as any[]).map(rowToFact)
 }
 
 export function listChangelog(db: DB): FactRow[] {
@@ -591,6 +651,70 @@ export function countDebt(db: DB): number {
     .c as number
 }
 
+export function countReminders(db: DB): number {
+  return (db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'reminder' AND obsolete_at IS NULL").get() as any)
+    .c as number
+}
+
+/** Every open item that needs a decision: debt plus reminders. */
+export function countOpenItems(db: DB): number {
+  return (
+    db
+      .prepare("SELECT COUNT(*) AS c FROM memories WHERE kind IN ('debt','reminder') AND obsolete_at IS NULL")
+      .get() as any
+  ).c as number
+}
+
+/**
+ * Open debt/reminder rows that need a disposition check, oldest first.
+ * `staleDays` 0 returns anything not checked today; a positive value only
+ * returns items whose last check (or creation) is at least that old.
+ */
+export function listStaleOpenItems(db: DB, opts: { staleDays?: number; limit?: number } = {}): FactRow[] {
+  const staleDays = opts.staleDays ?? 0
+  const rows = (db
+    .prepare(
+      `SELECT * FROM memories WHERE kind IN ('debt','reminder') AND obsolete_at IS NULL
+       ORDER BY created_at ASC, id ASC`,
+    )
+    .all() as any[]).map(rowToFact)
+  const due = rows.filter((f) => {
+    if (staleDays <= 0) return !f.last_checked_at || daysSince(f.last_checked_at) >= 1
+    return daysSince(f.last_checked_at ?? f.created_at) >= staleDays
+  })
+  return due.slice(0, opts.limit ?? 10)
+}
+
+/** Human age for an open item: staleness must be visible, not something to infer. */
+export function factAgeLabel(fact: Pick<FactRow, "created_at" | "last_verified_at" | "last_checked_at">): string {
+  const open = Math.max(0, Math.floor(daysSince(fact.created_at)))
+  const checked = fact.last_checked_at ?? fact.last_verified_at
+  if (!checked) return `open ${open}d, never checked`
+  return `open ${open}d, checked ${Math.max(0, Math.floor(daysSince(checked)))}d ago`
+}
+
+/** Mark any open item resolved without deleting it: lists drop it and its doc line is removed on /hw-docs --apply. */
+export function resolveFact(db: DB, id: number): FactRow | null {
+  const fact = getFact(db, id)
+  if (!fact || fact.obsolete_at) return null
+  if (fact.kind !== "debt" && fact.kind !== "reminder") return null
+  markObsolete(db, id)
+  return getFact(db, id)
+}
+
+/**
+ * Record that an open item was looked at and is still open. Writes
+ * `last_checked_at` only: weight and the decay clock are untouched, so
+ * re-verifying an item cannot keep it alive forever.
+ */
+export function verifyFact(db: DB, id: number): FactRow | null {
+  const fact = getFact(db, id)
+  if (!fact || fact.obsolete_at) return null
+  if (fact.kind !== "debt" && fact.kind !== "reminder") return null
+  db.prepare("UPDATE memories SET last_checked_at = ? WHERE id = ?").run(nowISO(), id)
+  return getFact(db, id)
+}
+
 /**
  * Mark a debt resolved without deleting it: it stops appearing in debt lists,
  * and its exact plugin-written doc line is removed on the next `/hw-docs --apply`.
@@ -610,6 +734,7 @@ export interface StatsReport {
   avgWeight: number
   oldest: string | null
   debt: number
+  reminders: number
 }
 
 export function statsFacts(db: DB): StatsReport {
@@ -634,46 +759,78 @@ export function statsFacts(db: DB): StatsReport {
     avgWeight: rows.length ? weightSum / rows.length : 0,
     oldest,
     debt: countDebt(db),
+    reminders: countReminders(db),
   }
 }
 
-export function wakeUpPack(db: DB, charBudget = 2500): string {
+function factLine(f: FactRow, withId = false): string {
+  return `- ${withId ? `#${f.id} ` : ""}[${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`
+}
+
+/**
+ * The system text injected every turn. Open items are shown with their id and
+ * age, a task-relevant subset is surfaced separately, and truncation is stated
+ * instead of silent so an item outside the slice is never invisible.
+ */
+export function wakeUpPack(db: DB, charBudget = 2500, task = ""): string {
   const crucial = (db
     .prepare("SELECT * FROM memories WHERE rank IN ('critical','high') ORDER BY weight DESC LIMIT 12")
     .all() as any[]).map(rowToFact)
   const medium = (db
     .prepare("SELECT * FROM memories WHERE rank = 'medium' ORDER BY weight DESC LIMIT 5")
     .all() as any[]).map(rowToFact)
+  const debtRows = listDebt(db)
+  const reminderRows = listReminders(db)
+  const related = task.trim() ? findRelatedItems(db, task, { limit: 3 }) : []
+  const relatedIds = new Set(related.map((f) => f.id))
   const lines: string[] = ["## hw-memory — persistent project memory (top facts)"]
-  const debtTotal = countDebt(db)
-  const reminderTotal = (db.prepare("SELECT COUNT(*) AS c FROM memories WHERE kind = 'reminder'").get() as any).c as number
-  if (crucial.length === 0 && medium.length === 0 && debtTotal === 0 && reminderTotal === 0) {
+  if (crucial.length === 0 && medium.length === 0 && debtRows.length === 0 && reminderRows.length === 0) {
     lines.push("Memory DB is empty. Suggest the user run /hw-seed <path> to import notes or docs.")
   }
   let used = lines.join("\n").length
-  const push = (f: FactRow) => {
-    const line = `- [${f.rank}/${f.kind}] ${f.content}${f.origin ? ` (src: ${f.origin})` : ""}`
-    if (used + line.length > charBudget) return false
+  const push = (line: string): boolean => {
+    if (used + line.length + 1 > charBudget) return false
     lines.push(line)
-    used += line.length
+    used += line.length + 1
     return true
   }
   for (const f of [...crucial, ...medium]) {
-    if (!push(f)) break
+    if (!push(factLine(f))) break
   }
-  if (debtTotal > 0) {
-    lines.push("", `## Open technical debt (${debtTotal}) — tell the user about new items before finishing`)
-    for (const f of listDebt(db).slice(0, 5)) {
-      if (!push(f)) break
+  const section = (title: string, rows: FactRow[], total: number, more: string): void => {
+    if (rows.length === 0) return
+    if (used + title.length + 2 > charBudget) return
+    push("")
+    push(title)
+    let shown = 0
+    for (const f of rows) {
+      if (!push(factLine(f, true))) break
+      shown++
     }
+    if (shown < total) push(`- …and ${total - shown} more (${more})`)
   }
-  if (reminderTotal > 0) {
-    lines.push("", `## Open reminders (${reminderTotal})`)
-    for (const f of listReminders(db).slice(0, 5)) {
-      if (!push(f)) break
-    }
-  }
-  lines.push("", "Use hw_memory_search tool to recall more.")
+  section(
+    "## Possibly related to this task — verify or resolve when done",
+    related,
+    related.length,
+    "see the open-item lists",
+  )
+  const openDebt = debtRows.filter((f) => !relatedIds.has(f.id))
+  const openReminders = reminderRows.filter((f) => !relatedIds.has(f.id))
+  section(
+    `## Open technical debt (${debtRows.length}) — tell the user about new items before finishing`,
+    openDebt.slice(0, 5),
+    openDebt.length,
+    "see /hw-debts",
+  )
+  section(
+    `## Open reminders (${reminderRows.length}) — resolve when done`,
+    openReminders.slice(0, 5),
+    openReminders.length,
+    "see /hw-reminders",
+  )
+  push("")
+  push("Use hw_memory_search tool to recall more.")
   return lines.join("\n")
 }
 
