@@ -300,3 +300,40 @@ test("absolute and escaping paths are rejected without DB writes", async () => {
   assert.equal(countFacts(db), 0)
   assert.equal(scopeCount(db), 0)
 })
+
+test("russian markers and heuristics classify like their english counterparts", async () => {
+  const { dir, db } = await makeEnv()
+  write(
+    dir,
+    "ru-notes.md",
+    `# Заметки
+
+- [решение] Решили оставить SQLite единственным хранилищем проекта.
+- Долг: сверка отчётов до сих пор делается вручную из трёх источников.
+- [напоминание] Вернуться к проверке предзагрузки на следующей неделе.
+- Технический долг: модуль отчётов дублирует расчёт налогов.
+- Набор данных за 2024 год лежит без провенанса и без версии.
+- Ошибка в расчёте скидок повторяется при каждом импорте каталога.
+- Офис переехал на второй этаж в прошлом месяце.
+`,
+  )
+  const plan = applySeed(db, dir, "ru-notes.md")
+  assert.equal(plan.blocks.length, 7)
+  const expected = [
+    ["decision", "high"],
+    ["debt", "medium"],
+    ["reminder", "medium"],
+    ["debt", "medium"],
+    ["debt", "medium"],
+    ["gotcha", "high"],
+    ["reminder", "medium"],
+  ]
+  plan.blocks.forEach((block, i) => {
+    assert.equal(block.kind, expected[i][0], `block ${i} kind`)
+    assert.equal(block.rank, expected[i][1], `block ${i} rank`)
+  })
+  assert.ok(plan.changes.slice(0, 4).every((c) => c.reason === undefined), "markers need no reason")
+  assert.match(plan.changes[4].reason ?? "", /debt keywords/)
+  assert.match(plan.changes[5].reason ?? "", /gotcha keywords/)
+  assert.match(plan.changes[6].reason ?? "", /fallback/)
+})

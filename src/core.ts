@@ -818,7 +818,7 @@ export function wakeUpPack(db: DB, charBudget = 2500, task = ""): string {
   const openDebt = debtRows.filter((f) => !relatedIds.has(f.id))
   const openReminders = reminderRows.filter((f) => !relatedIds.has(f.id))
   section(
-    `## Open technical debt (${debtRows.length}) — tell the user about new items before finishing`,
+    `## Open debt (${debtRows.length}) — tell the user about new items before finishing`,
     openDebt.slice(0, 5),
     openDebt.length,
     "see /hw-debts",

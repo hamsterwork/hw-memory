@@ -4,11 +4,11 @@ You have permanent project memory via hw-memory tools and `/hw-*` commands. The 
 
 ## Commands (direct user invocation only)
 
-- `/hw-seed <path> [--apply] [--changed]`: seed memory from one file (no size cap) or a folder (capped). Dry-run report by default; `--apply` commits. Never seed on your own initiative.
+- `/hw-seed <path> [--apply] [--changed]`: seed memory from one file (no size cap) or a folder (capped). Dry-run report by default; `--apply` commits. Markers and keyword heuristics are recognised in English and Russian (`[decision]`/`[решение]`, `[debt]`/`[долг]`, `TODO:`/`вопрос:`). Never seed on your own initiative.
 - `/hw-docs [--apply] [--id N]`: review proposed doc updates and seeded-file drift. Writes only after approval. Doc files under `docs/hw-memory/` are plugin-managed; no markers in human docs.
 - `/hw-changes [version] [--source git|journal] [--ai] [--export]`: human-readable change list since a git tag or checkpoint. Deterministic by default; `--ai` is opt-in and calls a model.
 - `/hw-dashboard [--prune]`: top debts, reminders, prune proposals and pending doc updates. `--prune` approves all proposed medium-rank prunes.
-- `/hw-debts`: list open technical debt. `/hw-reminders`: list reminders, plans and open questions.
+- `/hw-debts`: list open debt (code, process, data, research). `/hw-reminders`: list reminders, plans and open questions.
 
 Use `hw_memory_add` for new facts, `hw_memory_search` to recall them, `hw_memory_stats`/`hw_memory_forget`/`hw_memory_debt`/`hw_memory_reminder`/`hw_memory_config` for maintenance. Tool names keep the `hw_memory_` prefix; commands use `hw-`.
 
@@ -24,7 +24,11 @@ Use `hw_memory_add` for new facts, `hw_memory_search` to recall them, `hw_memory
 
 ## Open items: debt and reminders (hw_memory_debt / hw_memory_reminder)
 
-- When you notice a **bug, mismatch or error unrelated to the current task**, record it immediately: `hw_memory_add` with `kind: debt` and `rank` from `medium` to `critical` (severity reflects impact — a formatting nit is `medium`, a potential 500 is `critical`).
+- **Debt is a knowingly accepted cost that grows while it stays open** — not only code. Record it immediately with `kind: debt` and `rank` from `medium` to `critical`; severity is the cost of delay (a formatting nit is `medium`, a silently wrong report or a potential 500 is `critical`):
+  - code: workaround, missing test, duplicated logic, API mismatch;
+  - management: manual reconciliation, two reports defining one metric differently, undocumented decision, a step only one person can run;
+  - research: dataset without provenance or version, unreproducible analysis, unvalidated assumption, stale source.
+- If ignoring it gets more expensive, it is debt; if it only needs doing, it is a `reminder`.
 - Record plans, open questions and follow-ups with `kind: reminder`.
 - Both kinds stay until they are explicitly disposed of, and every list shows age (`open 41d, checked 18d ago`):
   - `action: verify` — you checked it and it is still open. This records the check date only; weight and the decay clock are untouched, so re-verifying an item cannot keep it alive forever.

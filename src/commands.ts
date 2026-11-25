@@ -69,7 +69,7 @@ const descriptions: Record<CommandName, string> = {
   "hw-seed": "Seed memory from a file or folder. Dry-run by default; --apply commits.",
   "hw-docs": "Review and write proposed doc updates; report drift in seeded files.",
   "hw-dashboard": "Show top debts, reminders, prune proposals and pending doc updates.",
-  "hw-debts": "List all open technical debt by current weight.",
+  "hw-debts": "List all open debt by current weight.",
   "hw-reminders": "List all reminders by current weight.",
 }
 

@@ -155,7 +155,7 @@ export function dashboardOperation(db: DB, root: string, args: CommandArgs): str
 
 export function debtsOperation(db: DB): string {
   const rows = listDebt(db)
-  return rows.length === 0 ? "No open technical debt." : formatOpenItems(rows)
+  return rows.length === 0 ? "No open debt." : formatOpenItems(rows)
 }
 
 export function remindersOperation(db: DB): string {

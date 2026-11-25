@@ -20,6 +20,12 @@ test("firstErrorLine finds last error-looking line", () => {
   assert.equal(firstErrorLine("no errors here at all"), null)
 })
 
+test("firstErrorLine recognises russian failure output", () => {
+  assert.equal(firstErrorLine("Сборка запущена\nОшибка: не найден модуль left-pad"), "Ошибка: не найден модуль left-pad")
+  assert.equal(firstErrorLine("Сборка не удалась"), "Сборка не удалась")
+  assert.equal(firstErrorLine("Всё собралось без замечаний"), null)
+})
+
 test("extractFromBash captures failed command as error candidate", () => {
   const candidates = extractFromBash("npm run build", "Error: Cannot find module '../src/core.ts'", 1)
   assert.equal(candidates.length, 1)
@@ -54,6 +60,9 @@ test("extractFromAssistantText detects decision sentences en and ru", () => {
   const ru = extractFromAssistantText("Обсудили варианты. Будем использовать Redis для кеша сессий. Просто текст без решений.")
   assert.equal(ru.length, 1)
   assert.ok(ru[0].content.includes("Redis"))
+  const ruMore = extractFromAssistantText("Взвесили риски. Решили перейти на Postgres в следующем квартале.")
+  assert.equal(ruMore.length, 1)
+  assert.ok(ruMore[0].content.includes("Postgres"))
 })
 
 test("extractFromAssistantText skips code and long sentences", () => {

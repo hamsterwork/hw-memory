@@ -66,14 +66,14 @@ Seed a file or folder once, then let the agent work normally. It recalls saved f
 | `/hw-docs [--apply] [--id N]` | Review and write proposed doc updates; report drift |
 | `/hw-changes [version] [--source git\|journal] [--ai] [--export]` | Change list and changelog export |
 | `/hw-dashboard [--prune]` | Debts, reminders, prune proposals, doc updates |
-| `/hw-debts` | List open technical debt |
+| `/hw-debts` | List open debt and its age |
 | `/hw-reminders` | List reminders, plans and open questions |
 
 Reports are deterministic; only `/hw-changes --ai` calls a model.
 
 ### Tools
 
-`hw_memory_add`, `hw_memory_search`, `hw_memory_stats`, `hw_memory_forget`, `hw_memory_debt` (list/verify/resolve technical debt), `hw_memory_reminder` (list/verify/resolve reminders) and `hw_memory_config` (settings). Just ask your agent to remember, recall or configure something — it will pick the right tool.
+`hw_memory_add`, `hw_memory_search`, `hw_memory_stats`, `hw_memory_forget`, `hw_memory_debt` (list/verify/resolve debt), `hw_memory_reminder` (list/verify/resolve reminders) and `hw_memory_config` (settings). Just ask your agent to remember, recall or configure something — it will pick the right tool.
 
 ### Settings
 
@@ -100,7 +100,7 @@ hw-memory never overwrites your prose in docs, never writes a doc without `/hw-d
 
 ### Scoped seeding
 
-`/hw-seed <path>` reads one file (no size limit) or a folder (200 files / 1 MiB per file / depth 8 by default). It shows a dry-run report first; `--apply` saves the result. Bullets are classified by markers such as `[decision]`, `[gotcha]` and `TODO:`, or by keyword heuristics. Facts that disappear from a seeded scope are demoted, not silently deleted. After you edit a seeded file, drift is reported at idle, and `/hw-seed <path> --apply` re-syncs that scope.
+`/hw-seed <path>` reads one file (no size limit) or a folder (200 files / 1 MiB per file / depth 8 by default). It shows a dry-run report first; `--apply` saves the result. Bullets are classified by markers such as `[decision]`, `[gotcha]` and `TODO:` or by keyword heuristics, in English and Russian (`[решение]`, `[долг]`, `вопрос:` and their keyword equivalents). Facts that disappear from a seeded scope are demoted, not silently deleted. After you edit a seeded file, drift is reported at idle, and `/hw-seed <path> --apply` re-syncs that scope.
 
 ### Managed docs
 
@@ -108,7 +108,7 @@ For each enabled kind, new facts are queued as proposals. `/hw-docs` shows what 
 
 ### Open items: debt and reminders
 
-Debt and reminders never decay away on their own, so they are tracked with a disposition instead of a lifetime:
+Debt and reminders never decay away on their own, so they are tracked with a disposition instead of a lifetime. **Debt is a knowingly accepted cost that grows while it stays open** — in code (a workaround, a missing test, an API mismatch), in management (manual reconciliation, one metric defined differently in two reports, a step only one person can run) and in research (a dataset without provenance or version, an unreproducible analysis, a stale source). A reminder is work that only needs doing. If ignoring it gets more expensive, it is debt; if it only needs doing, it is a reminder. Two actions dispose of them:
 
 - `action: verify` records that the item was checked and is still open. Only the check date moves — weight and the decay clock are untouched, so re-verifying cannot keep an item alive forever.
 - `action: resolve` marks it done. It leaves every list and its managed-doc line is removed on the next `/hw-docs --apply`.
@@ -127,7 +127,7 @@ Facts lose weight with age and infrequent use, but important ones are kept: noth
 
 ```sh
 npm install
-npm test              # node --test, 101 tests
+npm test              # node --test, 103 tests
 npm run test:install  # installer checks
 npm run test:update   # updater checks
 npm run build         # rebuild plugin/hw-memory.ts

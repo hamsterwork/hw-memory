@@ -18,7 +18,7 @@ export function commandSignature(cmd: string): string {
 }
 
 const ERROR_RE =
-  /(?:\berror\b|\bfatal\b|\bcannot\b|\bnot found\b|\bno such\b|econnrefused|err_[\w.]+|\bexception\b|\btraceback\b|permission denied|\bfailed\b)/i
+  /(?:\berror\b|\bfatal\b|\bcannot\b|\bnot found\b|\bno such\b|econnrefused|err_[\w.]+|\bexception\b|\btraceback\b|permission denied|\bfailed\b|ошибк|не удал|не найд|исключени|фатальн|отказано в доступе)/i
 
 export function firstErrorLine(output: string): string | null {
   const lines = output.split("\n").filter((l) => l.trim().length > 0).slice(-50)
@@ -70,7 +70,7 @@ export function extractFromBash(cmd: string, output: string, exitCode: number | 
 }
 
 const DECISION_RE =
-  /(?<![\p{L}\p{N}_])(?:we'?ll use|let'?s use|let us use|we use|switch(?:ing|ed)? to|decided to|we choose|we chose|moved to|sticking with|settled on|going with|будем использовать|будем юзать|переходим на|перешли на|выбираем|выбрали|решено|остановились на|используем)(?![\p{L}\p{N}_])/iu
+  /(?<![\p{L}\p{N}_])(?:we'?ll use|let'?s use|let us use|we use|switch(?:ing|ed)? to|decided to|we choose|we chose|moved to|sticking with|settled on|going with|будем использовать|будем юзать|переходим на|перешли на|выбираем|выбрали|решили|решено|остановились на|используем)(?![\p{L}\p{N}_])/iu
 
 export function extractFromAssistantText(text: string): Candidate[] {
   const out: Candidate[] = []

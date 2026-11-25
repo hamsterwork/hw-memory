@@ -12716,8 +12716,8 @@ function titleFrom(content, keywords = []) {
   if (keywords.length > 0) {
     return keywords.slice(0, 2).map((k) => k[0].toUpperCase() + k.slice(1)).join(" ");
   }
-  const words = content.split(/\s+/).slice(0, 5).join(" ");
-  return truncate(words, 60);
+  const words2 = content.split(/\s+/).slice(0, 5).join(" ");
+  return truncate(words2, 60);
 }
 
 // src/core.ts
@@ -13324,7 +13324,7 @@ function wakeUpPack(db, charBudget = 2500, task = "") {
   const openDebt = debtRows.filter((f) => !relatedIds.has(f.id));
   const openReminders = reminderRows.filter((f) => !relatedIds.has(f.id));
   section(
-    `## Open technical debt (${debtRows.length}) \u2014 tell the user about new items before finishing`,
+    `## Open debt (${debtRows.length}) \u2014 tell the user about new items before finishing`,
     openDebt.slice(0, 5),
     openDebt.length,
     "see /hw-debts"
@@ -13372,7 +13372,7 @@ var KIND_TITLE = {
 var FILE_TITLE = {
   [DEFAULT_TARGET_PATH.decision]: "Decisions",
   [DEFAULT_TARGET_PATH.gotcha]: "Gotchas",
-  [DEFAULT_TARGET_PATH.debt]: "Technical Debt",
+  [DEFAULT_TARGET_PATH.debt]: "Debt",
   [DEFAULT_TARGET_PATH.reminder]: "Reminders",
   [DEFAULT_TARGET_PATH.changelog]: "Changelog"
 };
@@ -13748,40 +13748,44 @@ function resolveTarget(root, rel) {
 function slugify(text) {
   return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "") || "notes";
 }
+function words(source) {
+  return new RegExp(`(?<![\\p{L}\\p{N}_])(?:${source})(?![\\p{L}\\p{N}_])`, "iu");
+}
 var MARKERS = [
-  { re: /^\[decision\]/i, kind: "decision", rank: "high" },
-  { re: /^decision\s*:/i, kind: "decision", rank: "high" },
-  { re: /^\[gotcha\]/i, kind: "gotcha", rank: "high" },
-  { re: /^gotcha\s*:/i, kind: "gotcha", rank: "high" },
-  { re: /^pitfall\s*:/i, kind: "gotcha", rank: "high" },
-  { re: /^\[debt\]/i, kind: "debt", rank: "medium" },
-  { re: /^debt\s*:/i, kind: "debt", rank: "medium" },
-  { re: /^\[reminder\]/i, kind: "reminder", rank: "medium" },
-  { re: /^reminder\s*:/i, kind: "reminder", rank: "medium" },
-  { re: /^todo\s*:/i, kind: "reminder", rank: "medium" },
-  { re: /^open\s+question\s*:/i, kind: "reminder", rank: "medium" }
+  { re: /^\[(?:decision|решение)\]/i, kind: "decision", rank: "high" },
+  { re: /^(?:decision|решение)\s*:/i, kind: "decision", rank: "high" },
+  { re: /^\[(?:gotcha|подвох)\]/i, kind: "gotcha", rank: "high" },
+  { re: /^(?:gotcha|pitfall|подвох|грабли)\s*:/i, kind: "gotcha", rank: "high" },
+  { re: /^\[(?:debt|долг|техдолг)\]/i, kind: "debt", rank: "medium" },
+  { re: /^(?:debt|долг|техдолг|technical debt|технический долг)\s*:/i, kind: "debt", rank: "medium" },
+  { re: /^\[(?:reminder|todo|напоминание)\]/i, kind: "reminder", rank: "medium" },
+  { re: /^(?:reminder|todo|напоминание|open question|вопрос)\s*:/i, kind: "reminder", rank: "medium" }
 ];
 var HEURISTICS = [
   {
-    re: /\bdecided\b|\bwe(?:'ll| will)\s+use\b|\bswitch to\b/i,
+    re: words("decided|we'll use|we will use|switch to|\u0440\u0435\u0448\u0438\u043B\u0438|\u0432\u044B\u0431\u0440\u0430\u043B\u0438|\u043F\u0435\u0440\u0435\u0445\u043E\u0434\u0438\u043C \u043D\u0430|\u043F\u0435\u0440\u0435\u0448\u043B\u0438 \u043D\u0430|\u0438\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0435\u043C"),
     kind: "decision",
     rank: "high",
     label: "decision keywords"
   },
   {
-    re: /\berror\b|\bfailed\b|\bpitfall\b|\bwatch out\b/i,
+    re: words("error|failed|pitfall|watch out|\u043E\u0448\u0438\u0431\u043A\\p{L}*|\u0441\u0431\u043E\u0439|\u043D\u0435 \u0440\u0430\u0431\u043E\u0442\u0430\u0435\u0442|\u043F\u043E\u0434\u0432\u043E\u0445|\u043E\u0441\u0442\u043E\u0440\u043E\u0436\u043D\u043E|\u0433\u0440\u0430\u0431\u043B\u0438"),
     kind: "gotcha",
     rank: "high",
     label: "gotcha keywords"
   },
   {
-    re: /\brefactor\b|\bknown issue\b|\bworkaround\b|technical debt\b/i,
+    re: words(
+      "refactor|known issue|workaround|technical debt|\u0442\u0435\u0445\u0434\u043E\u043B\u0433|\u0442\u0435\u0445\u043D\u0438\u0447\u0435\u0441\u043A\\p{L}* \u0434\u043E\u043B\u0433\\p{L}*|\u0440\u0435\u0444\u0430\u043A\u0442\u043E\u0440\\p{L}*|\u043A\u043E\u0441\u0442\u044B\u043B\\p{L}*|\u043E\u0431\u0445\u043E\u0434\u043D\\p{L}* \u043F\u0443\u0442\\p{L}*|\u0432\u0440\u0443\u0447\u043D\u0443\u044E|\u0440\u0430\u0441\u0445\u043E\u0436\u0434\u0435\u043D\u0438\\p{L}*|\u0434\u0443\u0431\u043B\u0438\u0440\u0443\\p{L}*|\u043F\u0440\u043E\u0432\u0435\u043D\u0430\u043D\u0441\\p{L}*|\u0432\u043E\u0441\u043F\u0440\u043E\u0438\u0437\u0432\u043E\u0434\u0438\u043C\\p{L}*|\u0443\u0441\u0442\u0430\u0440\u0435\u043B\\p{L}*|\u043D\u0435\u043F\u0440\u043E\u0432\u0435\u0440\u0435\u043D\\p{L}*"
+    ),
     kind: "debt",
     rank: "medium",
     label: "debt keywords"
   },
   {
-    re: /\bneed to\b|\bfollow up\b|\blater\b|\binvestigate\b|\bquestion\b|\bplan\b/i,
+    re: words(
+      "need to|follow up|later|investigate|question|plan|\u043D\u0430\u043F\u043E\u043C\u0438\u043D\\p{L}*|\u043F\u043E\u0437\u0436\u0435|\u043F\u0440\u043E\u0432\u0435\u0440\u0438\u0442\u044C|\u0438\u0441\u0441\u043B\u0435\u0434\u043E\u0432\u0430\u0442\u044C|\u043E\u0442\u043A\u0440\u044B\u0442\\p{L}* \u0432\u043E\u043F\u0440\u043E\u0441"
+    ),
     kind: "reminder",
     rank: "medium",
     label: "reminder keywords"
@@ -14747,7 +14751,7 @@ function dashboardOperation(db, root, args) {
 }
 function debtsOperation(db) {
   const rows = listDebt(db);
-  return rows.length === 0 ? "No open technical debt." : formatOpenItems(rows);
+  return rows.length === 0 ? "No open debt." : formatOpenItems(rows);
 }
 function remindersOperation(db) {
   const rows = listReminders(db);
@@ -14806,7 +14810,7 @@ var descriptions = {
   "hw-seed": "Seed memory from a file or folder. Dry-run by default; --apply commits.",
   "hw-docs": "Review and write proposed doc updates; report drift in seeded files.",
   "hw-dashboard": "Show top debts, reminders, prune proposals and pending doc updates.",
-  "hw-debts": "List all open technical debt by current weight.",
+  "hw-debts": "List all open debt by current weight.",
   "hw-reminders": "List all reminders by current weight."
 };
 async function registerCommands(ctx, db, root) {
@@ -14838,7 +14842,7 @@ function commandSignature(cmd) {
   const tokens = cmd.trim().split(/\s+/).slice(0, 3).map((t) => (t.includes("/") ? t.split("/").pop() ?? t : t).toLowerCase());
   return tokens.join(" ");
 }
-var ERROR_RE = /(?:\berror\b|\bfatal\b|\bcannot\b|\bnot found\b|\bno such\b|econnrefused|err_[\w.]+|\bexception\b|\btraceback\b|permission denied|\bfailed\b)/i;
+var ERROR_RE = /(?:\berror\b|\bfatal\b|\bcannot\b|\bnot found\b|\bno such\b|econnrefused|err_[\w.]+|\bexception\b|\btraceback\b|permission denied|\bfailed\b|ошибк|не удал|не найд|исключени|фатальн|отказано в доступе)/i;
 function firstErrorLine(output) {
   const lines = output.split("\n").filter((l) => l.trim().length > 0).slice(-50);
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -14881,7 +14885,7 @@ function extractFromBash(cmd, output, exitCode) {
   }
   return out;
 }
-var DECISION_RE = /(?<![\p{L}\p{N}_])(?:we'?ll use|let'?s use|let us use|we use|switch(?:ing|ed)? to|decided to|we choose|we chose|moved to|sticking with|settled on|going with|будем использовать|будем юзать|переходим на|перешли на|выбираем|выбрали|решено|остановились на|используем)(?![\p{L}\p{N}_])/iu;
+var DECISION_RE = /(?<![\p{L}\p{N}_])(?:we'?ll use|let'?s use|let us use|we use|switch(?:ing|ed)? to|decided to|we choose|we chose|moved to|sticking with|settled on|going with|будем использовать|будем юзать|переходим на|перешли на|выбираем|выбрали|решили|решено|остановились на|используем)(?![\p{L}\p{N}_])/iu;
 function extractFromAssistantText(text) {
   const out = [];
   const sentences = text.split(/(?<=[.!?…])\s+/);
@@ -14958,7 +14962,7 @@ function formatOpenRows(rows) {
 }
 function makeTools(root, db) {
   const memoryAdd = defineTextTool({
-    description: "Store a durable project fact into hw-memory. One fact per call. Managed kinds (decision/gotcha/debt) are also written to their managed markdown file when that entity is enabled. Use for: pinned decisions, resolved pitfalls, technical debt, project constraints.",
+    description: "Store a durable project fact into hw-memory. One fact per call. Managed kinds (decision/gotcha/debt) are also written to their managed markdown file when that entity is enabled. Use for: pinned decisions, resolved pitfalls, debt (code, process, data or research), project constraints.",
     name: "hw_memory_add",
     schema: external_exports.object({
       content: external_exports.string().describe("One dense fact, single sentence or two. Language-agnostic."),
@@ -15029,7 +15033,7 @@ function makeTools(root, db) {
     }
   });
   const memoryDebt = defineTextTool({
-    description: "Technical debt found while working on other tasks. action=list (default) lists open debt with its age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
+    description: "Debt is a knowingly accepted cost that grows while it stays open \u2014 code, process, data or research, not only bugs. action=list (default) lists open debt with its age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
     name: "hw_memory_debt",
     schema: external_exports.object({
       action: external_exports.enum(["list", "verify", "resolve"]).optional().describe("list (default), verify or resolve."),
@@ -15049,12 +15053,12 @@ function makeTools(root, db) {
         return `Resolved debt #${args.id}. Its managed-doc line, if any, is removed on /hw-docs --apply.`;
       }
       const rows = listDebt(db);
-      if (rows.length === 0) return "No open technical debt.";
+      if (rows.length === 0) return "No open debt.";
       return formatOpenRows(rows);
     }
   });
   const memoryReminder = defineTextTool({
-    description: "Reminders are plans, open questions and follow-ups. action=list (default) lists open reminders with their age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (it leaves the lists; its managed-doc line, if any, is removed on /hw-docs --apply). Dispose of reminders a task touches before finishing it.",
+    description: "Reminders are work that only needs doing, with no compounding cost: plans, open questions and follow-ups. action=list (default) lists open reminders with their age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (it leaves the lists; its managed-doc line, if any, is removed on /hw-docs --apply). Dispose of reminders a task touches before finishing it.",
     name: "hw_memory_reminder",
     schema: external_exports.object({
       action: external_exports.enum(["list", "verify", "resolve"]).optional().describe("list (default), verify or resolve."),

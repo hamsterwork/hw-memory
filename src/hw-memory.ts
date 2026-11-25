@@ -88,7 +88,7 @@ function formatOpenRows(rows: FactRow[]): string {
 function makeTools(root: string, db: DB) {
   const memoryAdd = defineTextTool({
     description:
-      "Store a durable project fact into hw-memory. One fact per call. Managed kinds (decision/gotcha/debt) are also written to their managed markdown file when that entity is enabled. Use for: pinned decisions, resolved pitfalls, technical debt, project constraints.",
+      "Store a durable project fact into hw-memory. One fact per call. Managed kinds (decision/gotcha/debt) are also written to their managed markdown file when that entity is enabled. Use for: pinned decisions, resolved pitfalls, debt (code, process, data or research), project constraints.",
     name: "hw_memory_add",
     schema: z.object({
       content: z.string().describe("One dense fact, single sentence or two. Language-agnostic."),
@@ -176,7 +176,7 @@ function makeTools(root: string, db: DB) {
 
   const memoryDebt = defineTextTool({
     description:
-      "Technical debt found while working on other tasks. action=list (default) lists open debt with its age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
+      "Debt is a knowingly accepted cost that grows while it stays open — code, process, data or research, not only bugs. action=list (default) lists open debt with its age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (its exact managed-doc line, if any, is removed on /hw-docs --apply). Always tell the user about new debt before finishing a task.",
     name: "hw_memory_debt",
     schema: z.object({
       action: z.enum(["list", "verify", "resolve"]).optional().describe("list (default), verify or resolve."),
@@ -196,14 +196,14 @@ function makeTools(root: string, db: DB) {
         return `Resolved debt #${args.id}. Its managed-doc line, if any, is removed on /hw-docs --apply.`
       }
       const rows = listDebt(db)
-      if (rows.length === 0) return "No open technical debt."
+      if (rows.length === 0) return "No open debt."
       return formatOpenRows(rows)
     },
   })
 
   const memoryReminder = defineTextTool({
     description:
-      "Reminders are plans, open questions and follow-ups. action=list (default) lists open reminders with their age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (it leaves the lists; its managed-doc line, if any, is removed on /hw-docs --apply). Dispose of reminders a task touches before finishing it.",
+      "Reminders are work that only needs doing, with no compounding cost: plans, open questions and follow-ups. action=list (default) lists open reminders with their age; action=verify with id records that you checked it and it is still open (weight and decay clock unchanged); action=resolve with id marks it done (it leaves the lists; its managed-doc line, if any, is removed on /hw-docs --apply). Dispose of reminders a task touches before finishing it.",
     name: "hw_memory_reminder",
     schema: z.object({
       action: z.enum(["list", "verify", "resolve"]).optional().describe("list (default), verify or resolve."),

@@ -356,7 +356,7 @@ test("applyDocs removes an obsolete fact only while its exact line is intact", a
     applyDocs(f.db, f.root)
     text = read(f.root, DEBT)
     assert.ok(!text.includes(content))
-    assert.ok(text.startsWith("# Technical Debt"))
+    assert.ok(text.startsWith("# Debt"))
     const manifest = f.db.prepare("SELECT COUNT(*) AS c FROM doc_manifest").get() as any
     assert.equal(manifest.c, 0)
   } finally {

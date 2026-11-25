@@ -75,7 +75,7 @@ test("debt flow: add warns, list shows, resolve clears the open list", async () 
   const id = Number(list.match(/#(\d+)/)![1])
   const resolved = text(await tools.hw_memory_debt.execute({ action: "resolve", id }))
   assert.match(resolved, /Resolved/)
-  assert.equal(text(await tools.hw_memory_debt.execute({ action: "list" })), "No open technical debt.")
+  assert.equal(text(await tools.hw_memory_debt.execute({ action: "list" })), "No open debt.")
   await cleanup()
   rmSync(root, { recursive: true, force: true })
 })
@@ -360,7 +360,7 @@ test("context hook surfaces only the open items related to the last prompt", asy
   for (const hook of hooks.context) await hook(event)
   const pack = event.system[0].text
   assert.match(pack, /Possibly related to this task/)
-  const related = pack.split("## Possibly related")[1].split("## Open technical debt")[0]
+  const related = pack.split("## Possibly related")[1].split("## Open debt")[0]
   assert.match(related, /serializer mismatch/)
   assert.doesNotMatch(related, /CI runner/)
   await cleanup()

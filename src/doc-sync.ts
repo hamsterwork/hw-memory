@@ -43,7 +43,7 @@ const KIND_TITLE: Record<ManagedKind, string> = {
 const FILE_TITLE: Record<string, string> = {
   [DEFAULT_TARGET_PATH.decision]: "Decisions",
   [DEFAULT_TARGET_PATH.gotcha]: "Gotchas",
-  [DEFAULT_TARGET_PATH.debt]: "Technical Debt",
+  [DEFAULT_TARGET_PATH.debt]: "Debt",
   [DEFAULT_TARGET_PATH.reminder]: "Reminders",
   [DEFAULT_TARGET_PATH.changelog]: "Changelog",
 }

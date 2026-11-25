@@ -173,41 +173,50 @@ function slugify(text: string): string {
   )
 }
 
+/**
+ * Word-bounded alternation that also works for Cyrillic: JS `\b` is ASCII-only,
+ * so a `\b`-wrapped pattern silently never matches Russian text.
+ */
+function words(source: string): RegExp {
+  return new RegExp(`(?<![\\p{L}\\p{N}_])(?:${source})(?![\\p{L}\\p{N}_])`, "iu")
+}
+
 const MARKERS: { re: RegExp; kind: Kind; rank: Rank }[] = [
-  { re: /^\[decision\]/i, kind: "decision", rank: "high" },
-  { re: /^decision\s*:/i, kind: "decision", rank: "high" },
-  { re: /^\[gotcha\]/i, kind: "gotcha", rank: "high" },
-  { re: /^gotcha\s*:/i, kind: "gotcha", rank: "high" },
-  { re: /^pitfall\s*:/i, kind: "gotcha", rank: "high" },
-  { re: /^\[debt\]/i, kind: "debt", rank: "medium" },
-  { re: /^debt\s*:/i, kind: "debt", rank: "medium" },
-  { re: /^\[reminder\]/i, kind: "reminder", rank: "medium" },
-  { re: /^reminder\s*:/i, kind: "reminder", rank: "medium" },
-  { re: /^todo\s*:/i, kind: "reminder", rank: "medium" },
-  { re: /^open\s+question\s*:/i, kind: "reminder", rank: "medium" },
+  { re: /^\[(?:decision|решение)\]/i, kind: "decision", rank: "high" },
+  { re: /^(?:decision|решение)\s*:/i, kind: "decision", rank: "high" },
+  { re: /^\[(?:gotcha|подвох)\]/i, kind: "gotcha", rank: "high" },
+  { re: /^(?:gotcha|pitfall|подвох|грабли)\s*:/i, kind: "gotcha", rank: "high" },
+  { re: /^\[(?:debt|долг|техдолг)\]/i, kind: "debt", rank: "medium" },
+  { re: /^(?:debt|долг|техдолг|technical debt|технический долг)\s*:/i, kind: "debt", rank: "medium" },
+  { re: /^\[(?:reminder|todo|напоминание)\]/i, kind: "reminder", rank: "medium" },
+  { re: /^(?:reminder|todo|напоминание|open question|вопрос)\s*:/i, kind: "reminder", rank: "medium" },
 ]
 
 const HEURISTICS: { re: RegExp; kind: Kind; rank: Rank; label: string }[] = [
   {
-    re: /\bdecided\b|\bwe(?:'ll| will)\s+use\b|\bswitch to\b/i,
+    re: words("decided|we'll use|we will use|switch to|решили|выбрали|переходим на|перешли на|используем"),
     kind: "decision",
     rank: "high",
     label: "decision keywords",
   },
   {
-    re: /\berror\b|\bfailed\b|\bpitfall\b|\bwatch out\b/i,
+    re: words("error|failed|pitfall|watch out|ошибк\\p{L}*|сбой|не работает|подвох|осторожно|грабли"),
     kind: "gotcha",
     rank: "high",
     label: "gotcha keywords",
   },
   {
-    re: /\brefactor\b|\bknown issue\b|\bworkaround\b|technical debt\b/i,
+    re: words(
+      "refactor|known issue|workaround|technical debt|техдолг|техническ\\p{L}* долг\\p{L}*|рефактор\\p{L}*|костыл\\p{L}*|обходн\\p{L}* пут\\p{L}*|вручную|расхождени\\p{L}*|дублиру\\p{L}*|провенанс\\p{L}*|воспроизводим\\p{L}*|устарел\\p{L}*|непроверен\\p{L}*",
+    ),
     kind: "debt",
     rank: "medium",
     label: "debt keywords",
   },
   {
-    re: /\bneed to\b|\bfollow up\b|\blater\b|\binvestigate\b|\bquestion\b|\bplan\b/i,
+    re: words(
+      "need to|follow up|later|investigate|question|plan|напомин\\p{L}*|позже|проверить|исследовать|открыт\\p{L}* вопрос",
+    ),
     kind: "reminder",
     rank: "medium",
     label: "reminder keywords",
